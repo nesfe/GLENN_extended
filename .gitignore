@@ -32,3 +32,4 @@ bun.lockb
 *.njsproj
 *.sln
 *.sw?
+release-builds/

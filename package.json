@@ -2,11 +2,15 @@
   "name": "glenn-extended",
   "version": "2.0.0",
   "description": "Next-Generation Computational Aerodynamics Simulator based on NASA Glenn FoilSim and EngineSim concepts",
+  "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "electron:start": "tsc && vite build && electron .",
+    "electron:build:win": "tsc && vite build && electron-builder --win nsis portable --x64",
+    "electron:pack": "tsc && vite build && electron-builder --dir"
   },
   "repository": {
     "type": "git",
@@ -14,6 +18,39 @@
   },
   "author": "nesfe",
   "license": "MIT",
+  "build": {
+    "appId": "com.nesfe.glennextended",
+    "productName": "NASA Glenn FoilSim 3D PRO",
+    "directories": {
+      "output": "release-builds"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "assets/icons/icon.ico",
+      "signExecutable": false,
+      "signAndEditExecutable": false,
+      "target": [
+        "portable"
+      ],
+      "artifactName": "GLENN_FoilSim_PRO-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "NASA Glenn FoilSim 3D PRO",
+      "artifactName": "GLENN_FoilSim_PRO-${version}-Setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "GLENN_FoilSim_PRO-${version}-Portable.${ext}"
+    }
+  },
   "dependencies": {
     "chart.js": "^4.5.1",
     "lucide-react": "^1.60.0",
@@ -29,6 +66,8 @@
     "@types/three": "^0.186.0",
     "@vitejs/plugin-react": "^6.1.2",
     "autoprefixer": "^10.6.1",
+    "electron": "^44.9.1",
+    "electron-builder": "^26.15.3",
     "postcss": "^8.5.31",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
