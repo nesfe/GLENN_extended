@@ -1,0 +1,175 @@
+name: Build, test and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libx11-dev libxi-dev libxrandr-dev libxcursor-dev libxinerama-dev libxkbcommon-x11-0 libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+
+  build:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: macos-14
+            platform: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libx11-dev libxi-dev libxrandr-dev libxcursor-dev libxinerama-dev libxkbcommon-x11-0 libgl1-mesa-dev xvfb
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          key: release-${{ matrix.platform }}
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
+      - name: Version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Render every page and a HiDPI narrow window
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          for page in 0 1 2 3 4 5 6; do
+            timeout 30s xvfb-run -a -s '-screen 0 1600x1200x24' target/release/glenn-extended --screenshot "artifacts/screenshots/page-$page.png" --size 800x600 --page "$page"
+          done
+          timeout 30s xvfb-run -a -s '-screen 0 1920x1080x24' target/release/glenn-extended --screenshot artifacts/screenshots/hidpi.png --size 1280x720 --scale 1.5
+          test -s artifacts/screenshots/hidpi.png
+      - name: Package Windows portable executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/package | Out-Null
+          Copy-Item target/release/glenn-extended.exe artifacts/package/
+          Copy-Item README.md,LICENSE artifacts/package/
+          Copy-Item -Recurse docs artifacts/package/
+          Copy-Item assets/fonts/LICENSE-DejaVu.txt artifacts/package/
+          Compress-Archive -Path artifacts/package/* -DestinationPath "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip"
+          Copy-Item target/release/glenn-extended.exe "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.exe"
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p artifacts/package
+          cp target/release/glenn-extended README.md LICENSE assets/fonts/LICENSE-DejaVu.txt artifacts/package/
+          cp -r docs artifacts/package/
+          tar -czf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C artifacts/package .
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        run: |
+          app='artifacts/GLENN Extended.app'
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/glenn-extended "$app/Contents/MacOS/"
+          cp LICENSE assets/fonts/LICENSE-DejaVu.txt "$app/Contents/Resources/"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>glenn-extended</string>
+          <key>CFBundleIdentifier</key><string>com.nesfe.glennextended</string>
+          <key>CFBundleName</key><string>GLENN Extended</string>
+          <key>CFBundleVersion</key><string>$VERSION</string>
+          <key>CFBundleShortVersionString</key><string>$VERSION</string>
+          <key>NSHighResolutionCapable</key><true/>
+          <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict></plist>
+          PLIST
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "artifacts/GLENN-Extended-$VERSION-macos-aarch64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: |
+            artifacts/GLENN-Extended-*.zip
+            artifacts/GLENN-Extended-*.tar.gz
+            artifacts/GLENN-Extended-*.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Linux'
+        with:
+          name: ui-screenshots
+          path: artifacts/screenshots/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: binaries-*
+          path: artifacts/release
+          merge-multiple: true
+      - name: Publish version after every platform passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          tag="v$version"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo 'Tag must match Cargo.toml version' >&2
+            exit 1
+          fi
+          # Published versions are immutable. Bump Cargo.toml + Cargo.lock for the next release.
+          if gh release view "$tag" --json isDraft --jq '.isDraft' > /tmp/release-draft 2>/dev/null; then
+            if [[ "$(cat /tmp/release-draft)" == false ]]; then
+              echo "$tag is already published; nothing to do."
+              exit 0
+            fi
+            # Do not replace a draft created from a different commit.
+            target=$(gh release view "$tag" --json targetCommitish --jq '.targetCommitish')
+            test "$target" = "$GITHUB_SHA"
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "GLENN Extended $tag · Native Rust" --notes-file docs/RELEASE.md --draft
+          fi
+          cd artifacts/release
+          sha256sum GLENN-Extended-* > SHA256SUMS.txt
+          gh release upload "$tag" ./* --clobber
+          gh release edit "$tag" --draft=false --latest
