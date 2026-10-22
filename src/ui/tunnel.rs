@@ -10,6 +10,7 @@ pub struct View {
     pub pitch: f64,
     pub zoom: f64,
     pub animate: bool,
+    pub playback: f64,
     pub streamlines: bool,
     pub vortices: bool,
     pub forces: bool,
@@ -28,6 +29,7 @@ impl Default for View {
             pitch: 0.48,
             zoom: 1.0,
             animate: true,
+            playback: 0.05,
             streamlines: true,
             vortices: true,
             forces: true,
@@ -41,17 +43,45 @@ impl Default for View {
         }
     }
 }
-fn color(cp: f64, palette: usize) -> Color32 {
-    let t = ((cp + 2.0) / 3.0).clamp(0.0, 1.0) as f32;
-    let (a, b) = match palette {
-        1 => ([94.0, 48.0, 171.0], [248.0, 210.0, 86.0]),
-        2 => ([45.0, 62.0, 122.0], [247.0, 107.0, 67.0]),
-        _ => ([37.0, 160.0, 215.0], [244.0, 179.0, 75.0]),
+/// Shared pressure transfer function for surface colors and the legend.
+/// Neutral pressure is light; suction and overpressure remain distinguishable.
+pub(super) fn color(cp: f64, palette: usize) -> Color32 {
+    let stops = match palette {
+        1 => [
+            [-2.0, 70.0, 28.0, 130.0],
+            [-0.5, 184.0, 63.0, 140.0],
+            [0.0, 245.0, 169.0, 92.0],
+            [1.0, 252.0, 237.0, 151.0],
+        ],
+        2 => [
+            [-2.0, 39.0, 63.0, 139.0],
+            [-0.5, 92.0, 163.0, 206.0],
+            [0.0, 232.0, 232.0, 221.0],
+            [1.0, 224.0, 74.0, 52.0],
+        ],
+        _ => [
+            [-2.0, 33.0, 87.0, 178.0],
+            [-0.5, 46.0, 184.0, 206.0],
+            [0.0, 211.0, 226.0, 222.0],
+            [1.0, 245.0, 146.0, 52.0],
+        ],
     };
+    let cp = cp.clamp(-2.0, 1.0);
+    let i = stops.partition_point(|p| p[0] < cp).clamp(1, 3);
+    let (a, b) = (stops[i - 1], stops[i]);
+    let t = (cp - a[0]) / (b[0] - a[0]);
     Color32::from_rgb(
-        (a[0] + t * (b[0] - a[0])) as u8,
         (a[1] + t * (b[1] - a[1])) as u8,
         (a[2] + t * (b[2] - a[2])) as u8,
+        (a[3] + t * (b[3] - a[3])) as u8,
+    )
+}
+pub(super) fn speed_color(ratio: f64) -> Color32 {
+    let t = ((ratio - 0.4) / 1.6).clamp(0.0, 1.0) as f32;
+    Color32::from_rgb(
+        ((0.18 + 0.5 * t) * 255.0) as u8,
+        ((0.65 + 0.25 * t) * 255.0) as u8,
+        ((0.91 - 0.3 * t) * 255.0) as u8,
     )
 }
 /// Orthographic camera fits the current wing bounds before applying user zoom.
@@ -61,20 +91,37 @@ struct Camera {
     yaw: f64,
     pitch: f64,
     origin: [f64; 3],
-    alpha: f64,
 }
 impl Camera {
     fn rotate(&self, p: [f64; 3]) -> [f64; 3] {
         let x = p[0] - self.origin[0];
         let y = p[1] - self.origin[1];
         let z = p[2] - self.origin[2];
-        let (sa, ca) = self.alpha.sin_cos();
-        let (x, y) = (x * ca + y * sa, -x * sa + y * ca);
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         let horizontal = x * cy - z * sy;
         let depth = x * sy + z * cy;
         [horizontal, y * cp - depth * sp, y * sp + depth * cp]
+    }
+    fn matrix(&self, size: Vec2) -> glam::Mat4 {
+        let (sy, cy) = (self.yaw as f32).sin_cos();
+        let (sp, cp) = (self.pitch as f32).sin_cos();
+        let rotation = glam::Mat4::from_cols(
+            glam::Vec4::new(cy, -sy * sp, sy * cp, 0.0),
+            glam::Vec4::new(0.0, cp, sp, 0.0),
+            glam::Vec4::new(-sy, -cy * sp, cy * cp, 0.0),
+            glam::Vec4::W,
+        );
+        let depth = size.x.max(size.y) / self.scale as f32 * 20.0;
+        let projection = glam::Mat4::from_cols(
+            glam::Vec4::new(2.0 * self.scale as f32 / size.x, 0.0, 0.0, 0.0),
+            glam::Vec4::new(0.0, 2.0 * self.scale as f32 / size.y, 0.0, 0.0),
+            glam::Vec4::new(0.0, 0.0, -1.0 / depth, 0.0),
+            glam::Vec4::new(0.0, 0.0, 0.5, 1.0),
+        );
+        projection
+            * rotation
+            * glam::Mat4::from_translation(-glam::DVec3::from_array(self.origin).as_vec3())
     }
     fn project(&self, p: [f64; 3]) -> (Pos2, f64) {
         let [x, y, z] = self.rotate(p);
@@ -84,7 +131,19 @@ impl Camera {
         )
     }
 }
-pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, time: f64) {
+/// Numerical and GPU caches are independent of camera movement and animation.
+#[derive(Default)]
+pub struct Tunnel {
+    pub renderer: Option<super::render::Renderer>,
+    pub grid: Option<glenn_extended::physics::flow::SectionGrid>,
+    state: Option<glenn_extended::model::Simulation>,
+    paths: Vec<glenn_extended::physics::flow::Streamline>,
+    density: usize,
+    clock: f64,
+    last_time: Option<f64>,
+    style: Option<(bool, bool, bool, bool, usize)>,
+}
+pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mut Tunnel) {
     ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new("Аэродинамическая труба")
@@ -128,172 +187,136 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, time: f64) 
             view.zoom = (view.zoom * (scroll as f64 * 0.002).exp()).clamp(0.35, 3.0);
         }
     }
+    let now = ui.input(|input| input.time);
+    let elapsed = tunnel
+        .last_time
+        .map_or(0.0, |last| (now - last).clamp(0.0, 0.1));
+    tunnel.last_time = Some(now);
+    if view.animate {
+        tunnel.clock += elapsed * analysis.state.velocity / analysis.state.chord * view.playback;
+    }
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 10, Color32::from_rgb(9, 17, 27));
-    let mesh = &analysis.mesh;
     let state = &analysis.state;
     let aero = &analysis.current;
-    let mut bounds_min = [f64::INFINITY; 3];
-    let mut bounds_max = [f64::NEG_INFINITY; 3];
-    for p in &mesh.vertices {
+    let mesh = &analysis.mesh;
+    let world: Vec<_> = mesh
+        .vertices
+        .iter()
+        .map(|p| {
+            glenn_extended::geometry::body_to_world(state, glam::DVec3::from_array(*p)).to_array()
+        })
+        .collect();
+    let mut minimum = [f64::INFINITY; 3];
+    let mut maximum = [f64::NEG_INFINITY; 3];
+    for p in &world {
         for axis in 0..3 {
-            bounds_min[axis] = bounds_min[axis].min(p[axis]);
-            bounds_max[axis] = bounds_max[axis].max(p[axis]);
+            minimum[axis] = minimum[axis].min(p[axis]);
+            maximum[axis] = maximum[axis].max(p[axis]);
         }
     }
-    let origin = std::array::from_fn(|i| (bounds_min[i] + bounds_max[i]) * 0.5);
+    let origin = std::array::from_fn(|i| (minimum[i] + maximum[i]) * 0.5);
     let mut camera = Camera {
         center: rect.center(),
         scale: 1.0,
         yaw: view.yaw,
         pitch: view.pitch,
         origin,
-        alpha: state.alpha.to_radians(),
     };
-    let rotated: Vec<_> = mesh.vertices.iter().map(|p| camera.rotate(*p)).collect();
-    let width = rotated
-        .iter()
-        .map(|p| p[0])
-        .fold(f64::NEG_INFINITY, f64::max)
-        - rotated.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
-    let height = rotated
-        .iter()
-        .map(|p| p[1])
-        .fold(f64::NEG_INFINITY, f64::max)
-        - rotated.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
-    camera.scale = (rect.width() as f64 * 0.72 / width.max(state.chord))
-        .min(rect.height() as f64 * 0.6 / height.max(state.chord * 0.5))
+    let rotated: Vec<_> = world.iter().map(|p| camera.rotate(*p)).collect();
+    let extent = |axis: usize| {
+        rotated
+            .iter()
+            .map(|p| p[axis])
+            .fold(f64::NEG_INFINITY, f64::max)
+            - rotated
+                .iter()
+                .map(|p| p[axis])
+                .fold(f64::INFINITY, f64::min)
+    };
+    camera.scale = (rect.width() as f64 * 0.64 / extent(0).max(state.chord * 2.0))
+        .min(rect.height() as f64 * 0.50 / extent(1).max(state.chord * 0.85))
         * view.zoom;
-    for i in -6..=6 {
-        let z = i as f64 * state.span / 10.0;
-        let a = camera
-            .project([-2.0 * state.chord, -0.4 * state.chord, z])
-            .0;
-        let b = camera.project([3.0 * state.chord, -0.4 * state.chord, z]).0;
-        painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(27, 43, 57)));
-    }
-    // Streamlines and vortices are illustrative, not velocities from a 3D CFD solve.
-    if view.streamlines {
-        for lane in 0..(view.density * 4 + 5) {
-            let fraction = lane as f64 / (view.density * 4 + 4) as f64;
-            let z = (fraction - 0.5) * state.span * 1.4;
-            let y = 0.22 * state.chord;
-            let points: Vec<Pos2> = (0..64)
-                .map(|i| {
-                    let x = -2.0 + 5.0 * i as f64 / 63.0;
-                    let bend = 0.22 * (-((x - 0.2) / 0.65).powi(2)).exp();
-                    camera
-                        .project([x * state.chord, y + bend * state.chord, z])
-                        .0
-                })
-                .collect();
-            painter.add(egui::Shape::line(
-                points,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(66, 155, 180, 90)),
+    if let Some(renderer) = &mut tunnel.renderer {
+        if tunnel
+            .grid
+            .as_ref()
+            .is_none_or(|grid| grid.foil != analysis.foil)
+        {
+            tunnel.grid = Some(glenn_extended::physics::flow::SectionGrid::new(
+                &analysis.foil,
+                &analysis.panel,
             ));
-            for particle in 0..3 {
-                let progress = (time * 0.25 * (state.velocity / 65.0).min(4.0)
-                    + fraction
-                    + particle as f64 / 3.0)
-                    .fract();
-                let x = -2.0 + 5.0 * progress;
-                let point = camera
-                    .project([
-                        x * state.chord,
-                        y + 0.22 * state.chord * (-((x - 0.2) / 0.65).powi(2)).exp(),
-                        z,
-                    ])
-                    .0;
-                if rect.contains(point) {
-                    painter.circle_filled(point, 1.6, CYAN);
-                }
-            }
+            tunnel.state = None;
         }
-    }
-    if view.vortices {
-        for sign in [-1.0, 1.0] {
-            let points = (0..100)
-                .map(|i| {
-                    let u = i as f64 / 99.0;
-                    let phase = 18.0 * u - time * 2.0;
-                    camera
-                        .project([
-                            (1.0 + 3.0 * u) * state.chord,
-                            0.12 * state.chord * phase.sin(),
-                            sign * state.span * 0.5 + 0.12 * state.chord * phase.cos(),
-                        ])
-                        .0
-                })
-                .collect();
-            painter.add(egui::Shape::line(
-                points,
-                Stroke::new(1.3, Color32::from_rgba_unmultiplied(168, 133, 230, 140)),
-            ));
+        if tunnel.state.as_ref() != Some(state) || tunnel.density != view.density {
+            let field = glenn_extended::physics::flow::FlowField {
+                analysis,
+                grid: tunnel.grid.as_ref().unwrap(),
+            };
+            tunnel.paths = field.streamlines(view.density);
+            tunnel.state = Some(state.clone());
+            tunnel.density = view.density;
+            tunnel.style = None;
         }
-    }
-    let projected: Vec<_> = mesh.vertices.iter().map(|p| camera.project(*p)).collect();
-    let mut triangles: Vec<_> = mesh.triangles.iter().collect();
-    triangles.sort_by(|a, b| {
-        let za = a.iter().map(|i| projected[*i].1).sum::<f64>();
-        let zb = b.iter().map(|i| projected[*i].1).sum::<f64>();
-        za.total_cmp(&zb)
-    });
-    let contour = analysis.foil.contour();
-    let n = contour.len();
-    let mut painted_mesh = egui::Mesh::default();
-    let mut wire_edges = Vec::new();
-    for triangle in triangles {
-        let points = triangle.map(|i| projected[i].0);
-        let index = triangle[0] % n;
-        let local = contour[index];
-        let pressure = if index < analysis.foil.upper.len() - 1 {
-            &aero.pressure.upper
-        } else {
-            &aero.pressure.lower
-        };
-        let cp = glenn_extended::geometry::interpolate(pressure, local.x);
-        let base = if view.pressure {
-            color(cp, view.palette)
-        } else {
-            Color32::from_rgb(90, 159, 174)
-        };
-        // Submit triangles directly. Polygon anti-aliasing creates unbounded
-        // mitres for nearly edge-on panels; a mesh keeps even thin panels stable.
-        let first = painted_mesh.vertices.len() as u32;
-        for position in points {
-            painted_mesh.vertices.push(egui::epaint::Vertex {
-                pos: position,
-                uv: egui::epaint::WHITE_UV,
-                color: base,
-            });
+        let style = (
+            view.streamlines,
+            view.vortices,
+            view.pressure,
+            view.wireframe,
+            view.palette,
+        );
+        if tunnel.style != Some(style) {
+            renderer.upload(&super::render::Scene::new(analysis, &tunnel.paths, view));
+            tunnel.style = Some(style);
         }
-        painted_mesh.indices.extend([first, first + 1, first + 2]);
-        if view.wireframe {
-            wire_edges.extend([
-                [points[0], points[1]],
-                [points[1], points[2]],
-                [points[2], points[0]],
-            ]);
-        }
-    }
-    painter.add(egui::Shape::mesh(painted_mesh));
-    for edge in wire_edges {
-        painter.line_segment(edge, Stroke::new(0.5, Color32::from_gray(40)));
+        let pixels = ui.ctx().pixels_per_point();
+        let texture = renderer.render(
+            [
+                (rect.width() * pixels) as u32,
+                (rect.height() * pixels) as u32,
+            ],
+            camera.matrix(rect.size()),
+            tunnel.clock as f32,
+        );
+        painter.image(
+            texture,
+            rect,
+            egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
     }
     if view.forces {
-        let origin = camera.project([0.0, 0.0, 0.0]).0;
-        for (label, delta, color) in [
-            ("L", Vec2::new(0.0, -70.0 * aero.cl.signum() as f32), CYAN),
-            ("D", Vec2::new(65.0, 0.0), AMBER),
+        let cp = aero.center_of_pressure.clamp(0.0, 1.0);
+        let origin_world =
+            glenn_extended::geometry::SectionFrame::at(state, 0.0).to_world(Point::new(cp, 0.0));
+        let origin = camera.project(origin_world.to_array()).0;
+        let force_scale = 110.0 / camera.scale / aero.lift.abs().max(aero.drag).max(1.0);
+        for (label, force, color) in [
+            (
+                format!("L {:.2} кН", aero.lift / 1000.0),
+                glam::DVec3::Y * aero.lift,
+                CYAN,
+            ),
+            (
+                format!("D {:.2} кН", aero.drag / 1000.0),
+                glam::DVec3::X * aero.drag,
+                AMBER,
+            ),
         ] {
-            painter.arrow(origin, delta, Stroke::new(2.5, color));
-            painter.text(
-                origin + delta,
-                egui::Align2::LEFT_BOTTOM,
-                label,
-                egui::FontId::proportional(14.0),
-                color,
-            );
+            let tip = camera
+                .project((origin_world + force * force_scale).to_array())
+                .0;
+            if tip.distance(origin) > 0.1 {
+                painter.arrow(origin, tip - origin, Stroke::new(2.0, color));
+                painter.text(
+                    tip,
+                    egui::Align2::LEFT_BOTTOM,
+                    label,
+                    egui::FontId::proportional(12.0),
+                    color,
+                );
+            }
         }
     }
     if view.probe {
@@ -313,6 +336,17 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, time: f64) 
             painter.line_segment([origin, tip], Stroke::new(1.5, AMBER));
         }
     }
+    // Opaque backplates keep quantitative legends legible over dense flow.
+    if view.pressure || view.streamlines {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                rect.right_top() + Vec2::new(-174.0, 8.0),
+                Vec2::new(164.0, 91.0),
+            ),
+            5,
+            Color32::from_rgb(9, 17, 27),
+        );
+    }
     if view.pressure {
         let legend_start = rect.right_top() + Vec2::new(-158.0, 18.0);
         for step in 0..100 {
@@ -331,12 +365,57 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, time: f64) 
             MUTED,
         );
     }
+    if view.streamlines {
+        let start = rect.right_top() + Vec2::new(-158.0, 65.0);
+        for step in 0..100 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    start + Vec2::new(step as f32 * 1.3, 0.0),
+                    Vec2::new(1.5, 7.0),
+                ),
+                0,
+                speed_color(0.4 + step as f64 * 1.6 / 99.0),
+            );
+        }
+        painter.text(
+            start + Vec2::new(0.0, 13.0),
+            egui::Align2::LEFT_TOP,
+            "V/V∞  0.4               2.0",
+            egui::FontId::proportional(10.0),
+            MUTED,
+        );
+    }
+    painter.rect_filled(
+        egui::Rect::from_min_size(rect.left_top() + Vec2::splat(8.0), Vec2::new(300.0, 49.0)),
+        5,
+        Color32::from_rgb(9, 17, 27),
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            rect.left_bottom() + Vec2::new(8.0, -35.0),
+            Vec2::new(350.0, 29.0),
+        ),
+        5,
+        Color32::from_rgb(9, 17, 27),
+    );
+    if let Some(grid) = &tunnel.grid {
+        let field = glenn_extended::physics::flow::FlowField { analysis, grid };
+        painter.text(
+            rect.left_top() + Vec2::new(16.0, 39.0),
+            egui::Align2::LEFT_TOP,
+            format!("Γ₀ {:.2} м²/с", field.tip_circulation()),
+            egui::FontId::proportional(11.0),
+            MUTED,
+        );
+    }
     painter.text(
         rect.left_top() + Vec2::splat(16.0),
         egui::Align2::LEFT_TOP,
         format!(
             "{}  /  {:.1}°  /  {:.0} м/с",
-            state.profile_name, state.alpha, state.velocity
+            state.profile_name.chars().take(24).collect::<String>(),
+            state.alpha,
+            state.velocity
         ),
         egui::FontId::proportional(13.0),
         MUTED,
@@ -344,7 +423,7 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, time: f64) 
     painter.text(
         rect.left_bottom() + Vec2::new(16.0, -14.0),
         egui::Align2::LEFT_BOTTOM,
-        "Геометрия в метрах · линии тока иллюстративные",
+        "Панельное поле + приближённый след · единицы: м",
         egui::FontId::proportional(11.0),
         MUTED,
     );
@@ -363,20 +442,76 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, time: f64) 
         for (i, label) in ["Океан", "Плазма", "Тепловая"].iter().enumerate() {
             ui.selectable_value(&mut view.palette, i, *label);
         }
-        ui.add(egui::Slider::new(&mut view.density, 1..=5).text("Дым"));
+    });
+    ui.horizontal_wrapped(|ui| {
+        for control in 0..2 {
+            ui.allocate_ui_with_layout(
+                Vec2::new(250.0, 30.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().slider_width = 110.0;
+                    if control == 0 {
+                        ui.add(egui::Slider::new(&mut view.density, 1..=5).text("Линии"));
+                    } else {
+                        ui.add(
+                            egui::Slider::new(&mut view.playback, 0.01..=1.0)
+                                .logarithmic(true)
+                                .text("Время ×"),
+                        );
+                    }
+                },
+            );
+        }
     });
 }
 
 pub fn section(ui: &mut egui::Ui, analysis: &Analysis) {
     ui.heading("Сечение профиля");
-    ui.label("Контур, средняя линия и хорда; угол атаки задаёт направление набегающего потока.");
+    ui.label("Контур, средняя линия, хорда и нормальные силы; поток направлен слева направо.");
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 260.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 8, Color32::from_rgb(9, 17, 27));
-    let scale = (rect.width() * 0.76).min(700.0);
+    let alpha = analysis.state.alpha.to_radians();
+    let rotated: Vec<_> = analysis
+        .foil
+        .contour()
+        .iter()
+        .map(|p| {
+            glenn_extended::geometry::rotate_incidence(glam::DVec3::new(p.x - 0.5, p.y, 0.0), alpha)
+        })
+        .collect();
+    let vertical = rotated
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - rotated.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let scale = (rect.width() * 0.76)
+        .min(700.0)
+        .min(180.0 / vertical.max(0.15) as f32);
     let center = rect.center();
-    let transform = |p: Point| center + Vec2::new((p.x as f32 - 0.5) * scale, -p.y as f32 * scale);
+    let transform = |p: Point| {
+        let p = glenn_extended::geometry::rotate_incidence(
+            glam::DVec3::new(p.x - 0.5, p.y, 0.0),
+            alpha,
+        );
+        center + Vec2::new(p.x as f32 * scale, -p.y as f32 * scale)
+    };
+    painter.arrow(
+        rect.left_top() + Vec2::new(18.0, 52.0),
+        Vec2::new(65.0, 0.0),
+        Stroke::new(1.5, CYAN),
+    );
+    painter.text(
+        rect.left_top() + Vec2::new(90.0, 52.0),
+        egui::Align2::LEFT_CENTER,
+        format!(
+            "V∞ {:.0} м/с · α {:.1}°",
+            analysis.state.velocity, analysis.state.alpha
+        ),
+        egui::FontId::proportional(11.0),
+        MUTED,
+    );
     painter.line_segment(
         [
             transform(Point::new(0.0, 0.0)),
@@ -399,12 +534,22 @@ pub fn section(ui: &mut egui::Ui, analysis: &Analysis) {
         for pair in surface.windows(2).step_by(4) {
             let midpoint = Point::new((pair[0].x + pair[1].x) * 0.5, (pair[0].y + pair[1].y) * 0.5);
             let cp = glenn_extended::geometry::interpolate(pressure, midpoint.x);
-            let direction = if std::ptr::eq(surface, &analysis.foil.upper) {
-                -1.0
-            } else {
+            let outward_sign = if std::ptr::eq(surface, &analysis.foil.upper) {
                 1.0
+            } else {
+                -1.0
             };
-            let delta = Vec2::new(0.0, (direction * cp * 16.0).clamp(-35.0, 35.0) as f32);
+            let tangent_x = pair[1].x - pair[0].x;
+            let tangent_y = pair[1].y - pair[0].y;
+            let length = tangent_x.hypot(tangent_y).max(1e-12);
+            let normal_x = -outward_sign * tangent_y / length;
+            let normal_y = outward_sign * tangent_x / length;
+            let strength = (-cp * 16.0).clamp(-35.0, 35.0);
+            let normal = glenn_extended::geometry::rotate_incidence(
+                glam::DVec3::new(normal_x, normal_y, 0.0),
+                alpha,
+            );
+            let delta = Vec2::new((normal.x * strength) as f32, (-normal.y * strength) as f32);
             painter.arrow(transform(midpoint), delta, Stroke::new(1.0, MUTED));
         }
     }
