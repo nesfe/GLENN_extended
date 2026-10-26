@@ -265,7 +265,12 @@ impl Workbench {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("GLENN").size(25.0).strong().color(CYAN));
-                    ui.label(RichText::new("EXTENDED  /  3.1").size(12.0).color(MUTED));
+                    // From the manifest, so a release never shows a stale number.
+                    ui.label(
+                        RichText::new(concat!("EXTENDED  /  ", env!("CARGO_PKG_VERSION")))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
                     ui.separator();
                     ui.label("Аэродинамическая лаборатория");
                     if ui.button("Открыть…").clicked() {
