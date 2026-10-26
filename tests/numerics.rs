@@ -67,6 +67,52 @@ fn cambered_profile_generates_lift_at_zero_incidence() {
     assert!(result.moment < 0.0);
 }
 #[test]
+fn center_of_pressure_is_a_section_property() {
+    // x_cp follows from the pressure distribution the section view draws.
+    // Changing the planform changes the wing's lift coefficient but cannot move
+    // where that section's own resultant acts, so the marker must hold still.
+    let state = Simulation {
+        alpha: 5.0,
+        twist: 0.0,
+        sweep: 0.0,
+        ..Simulation::default()
+    };
+    let reference = Analysis::new(state.clone()).unwrap().current;
+    for (name, change) in [
+        (
+            "span",
+            (|s: &mut Simulation| s.span = 34.0) as fn(&mut Simulation),
+        ),
+        ("taper", |s| s.taper = 0.22),
+        ("winglets", |s| s.has_winglets = true),
+    ] {
+        let mut sample = state.clone();
+        change(&mut sample);
+        let moved = Analysis::new(sample).unwrap().current;
+        assert!(
+            (moved.cl - reference.cl).abs() > 1e-4,
+            "{name} should change the wing lift coefficient"
+        );
+        assert!(
+            (moved.center_of_pressure - reference.center_of_pressure).abs() < 1e-12,
+            "{name} moved x_cp from {} to {}",
+            reference.center_of_pressure,
+            moved.center_of_pressure
+        );
+    }
+    // A cambered section at positive incidence carries its load behind the
+    // leading edge and ahead of mid-chord.
+    assert!(
+        (0.25..0.5).contains(&reference.center_of_pressure),
+        "x_cp {}",
+        reference.center_of_pressure
+    );
+    // Symmetric and unloaded: the formula must not divide by a vanishing lift.
+    let unloaded = Analysis::new(symmetric()).unwrap().current;
+    assert_eq!(unloaded.center_of_pressure, 0.25);
+}
+
+#[test]
 fn every_preset_and_environment_is_finite() {
     for preset in presets() {
         preset.state.validate().unwrap();
@@ -224,19 +270,280 @@ fn mesh_normals_point_outward() {
     );
 }
 
+/// Thickness and camber of an imported profile, sampled on a common grid.
+fn shape(state: &Simulation) -> Vec<(f64, f64)> {
+    let foil = Airfoil::generate(state);
+    (0..=40)
+        .map(|i| {
+            let x = i as f64 / 40.0;
+            let upper = glenn_extended::geometry::interpolate(&foil.upper, x);
+            let lower = glenn_extended::geometry::interpolate(&foil.lower, x);
+            (upper - lower, (upper + lower) * 0.5)
+        })
+        .collect()
+}
+
 #[test]
-fn dxf_polyline_roundtrip_and_rejected_arc() {
+fn dxf_import_handles_the_shapes_real_cad_exports() {
     let state = Simulation::default();
-    let foil = Airfoil::generate(&state);
-    let mut text = String::from("0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n");
-    for point in foil.contour() {
-        text.push_str(&format!("10\n{}\n20\n{}\n", point.x, point.y));
+    let contour = Airfoil::generate(&state).contour();
+    // Reference is the same contour taken through the DAT path. Both routes
+    // resample onto the solver's cosine stations, so any difference left is
+    // the DXF parser's own and not an artefact of resampling.
+    let reference = shape(
+        &interchange::import_airfoil(
+            &contour
+                .iter()
+                .map(|p| format!("{} {}\n", p.x, p.y))
+                .collect::<String>(),
+            "reference.dat",
+            &state,
+        )
+        .unwrap(),
+    );
+    let vertices = |points: &[glenn_extended::model::Point]| {
+        points
+            .iter()
+            .map(|p| format!("10\n{}\n20\n{}\n30\n0.0\n", p.x, p.y))
+            .collect::<String>()
+    };
+    let section = |body: String| format!("0\nSECTION\n2\nENTITIES\n{body}0\nENDSEC\n0\nEOF\n");
+    let lwpolyline = |points: &[glenn_extended::model::Point]| {
+        format!(
+            "0\nLWPOLYLINE\n5\n1F2\n100\nAcDbEntity\n8\nairfoil\n100\nAcDbPolyline\n\
+             90\n{}\n70\n1\n43\n0.0\n{}210\n0.0\n220\n0.0\n230\n1.0\n",
+            points.len(),
+            vertices(points)
+        )
+    };
+    let reversed: Vec<_> = contour.iter().rev().copied().collect();
+    let rotated: Vec<_> = contour[contour.len() / 3..]
+        .iter()
+        .chain(&contour[..contour.len() / 3])
+        .copied()
+        .collect();
+    // Millimetre drawing offset away from the origin, as a CAD sheet would be.
+    let scaled: Vec<_> = contour
+        .iter()
+        .map(|p| glenn_extended::model::Point::new(p.x * 250.0 + 1200.0, p.y * 250.0 - 430.0))
+        .collect();
+    let old_style = format!(
+        "0\nPOLYLINE\n8\n0\n66\n1\n70\n1\n10\n0.0\n20\n0.0\n30\n0.0\n{}0\nSEQEND\n8\n0\n",
+        contour
+            .iter()
+            .map(|p| format!("0\nVERTEX\n8\n0\n10\n{}\n20\n{}\n30\n0.0\n", p.x, p.y))
+            .collect::<String>()
+    );
+    // A SPLINE through the contour as fit points: what most CAD writes.
+    let spline = format!(
+        "0\nSPLINE\n8\n0\n70\n8\n71\n3\n74\n{}\n{}",
+        contour.len(),
+        contour
+            .iter()
+            .map(|p| format!("11\n{}\n21\n{}\n31\n0.0\n", p.x, p.y))
+            .collect::<String>()
+    );
+    // Clamped uniform degree-3 spline given by control points only.
+    let control = format!(
+        "0\nSPLINE\n8\n0\n70\n8\n71\n3\n73\n{}\n{}",
+        contour.len(),
+        vertices(&contour)
+    );
+    let noise = "0\nLINE\n8\nconstruction\n10\n0.0\n20\n0.0\n11\n1.0\n21\n0.0\n\
+                 0\nTEXT\n8\nnotes\n10\n0.2\n20\n0.3\n40\n0.05\n1\nNACA 2412\n\
+                 0\nPOINT\n8\n0\n10\n0.5\n20\n0.0\n30\n0.0\n";
+    // A small closed box must not win over the profile contour.
+    let flap = "0\nLWPOLYLINE\n90\n4\n70\n1\n10\n1.1\n20\n0.0\n10\n1.4\n20\n0.02\n\
+                10\n1.4\n20\n-0.02\n10\n1.1\n20\n-0.01\n";
+
+    for (name, text, tolerance) in [
+        ("modern lwpolyline", section(lwpolyline(&contour)), 1e-9),
+        ("reversed winding", section(lwpolyline(&reversed)), 1e-9),
+        ("rotated start point", section(lwpolyline(&rotated)), 1e-9),
+        ("millimetres, offset", section(lwpolyline(&scaled)), 1e-9),
+        ("r12 polyline/vertex", section(old_style), 1e-9),
+        ("spline fit points", section(spline), 1e-9),
+        ("spline control points", section(control), 0.004),
+        (
+            "drawing with construction geometry",
+            section(lwpolyline(&contour) + noise),
+            1e-9,
+        ),
+        (
+            "two contours, profile is the wider",
+            section(lwpolyline(&contour) + flap),
+            1e-9,
+        ),
+        (
+            "blank padding and CRLF",
+            format!(
+                "\n{}\n",
+                section(lwpolyline(&contour)).replace('\n', "\r\n")
+            ),
+            1e-9,
+        ),
+    ] {
+        let imported = interchange::import_airfoil(&text, "profile.dxf", &state)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(imported.profile_type, Profile::Custom, "{name}");
+        let analysis = Analysis::new(imported.clone())
+            .unwrap_or_else(|error| panic!("{name} solver: {error}"));
+        assert!(analysis.current.cl.is_finite(), "{name}");
+        for (station, (actual, expected)) in shape(&imported).iter().zip(&reference).enumerate() {
+            assert!(
+                (actual.0 - expected.0).abs() < tolerance
+                    && (actual.1 - expected.1).abs() < tolerance,
+                "{name} at station {station}: thickness {} vs {}, camber {} vs {}",
+                actual.0,
+                expected.0,
+                actual.1,
+                expected.1
+            );
+        }
     }
-    text.push_str("0\nENDSEC\n0\nEOF\n");
-    let imported = interchange::import_airfoil(&text, "profile.dxf", &state).unwrap();
+
+    // A drawing with no contour at all must say so instead of inventing one.
+    assert!(interchange::import_airfoil(&section(noise.into()), "lines.dxf", &state).is_err());
+    assert!(
+        interchange::import_airfoil("AutoCAD Binary DXF\0\0", "bin.dxf", &state)
+            .is_err_and(|error| error.contains("двоичном"))
+    );
+    assert!(
+        interchange::import_airfoil("0\nSECTION\nnot-a-code\n7\n", "bad.dxf", &state)
+            .is_err_and(|error| error.contains("группового кода"))
+    );
+}
+
+#[test]
+fn import_is_invariant_to_drawing_scale_and_position() {
+    // A CAD sheet puts the profile wherever it likes, in whatever unit. Chord
+    // and camber are measured from the leading edge, so the imported shape
+    // must not depend on where the drawing sits.
+    let state = Simulation::default();
+    let contour = Airfoil::generate(&state).contour();
+    let selig = |points: &[glenn_extended::model::Point]| {
+        points
+            .iter()
+            .map(|p| format!("{} {}\n", p.x, p.y))
+            .collect::<String>()
+    };
+    let reference = interchange::import_airfoil(&selig(&contour), "ref.dat", &state).unwrap();
+    for (scale, dx, dy) in [
+        (1.0, 0.0, 0.0),
+        (250.0, 1200.0, -430.0),
+        (0.04, -9.5, 61.0),
+        (1000.0, 0.0, 250_000.0),
+    ] {
+        let moved: Vec<_> = contour
+            .iter()
+            .map(|p| glenn_extended::model::Point::new(p.x * scale + dx, p.y * scale + dy))
+            .collect();
+        let imported = interchange::import_airfoil(&selig(&moved), "moved.dat", &state)
+            .unwrap_or_else(|error| panic!("scale {scale} offset ({dx}, {dy}): {error}"));
+        for (surface, expected) in [
+            (&imported.custom_upper, &reference.custom_upper),
+            (&imported.custom_lower, &reference.custom_lower),
+        ] {
+            let surface = surface.as_ref().unwrap();
+            let expected = expected.as_ref().unwrap();
+            assert_eq!(surface.len(), expected.len(), "scale {scale}");
+            for (actual, expected) in surface.iter().zip(expected) {
+                assert!(
+                    (actual.x - expected.x).abs() < 1e-9 && (actual.y - expected.y).abs() < 1e-9,
+                    "scale {scale} offset ({dx}, {dy}): ({}, {}) vs ({}, {})",
+                    actual.x,
+                    actual.y,
+                    expected.x,
+                    expected.y
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn both_imported_surfaces_span_the_whole_chord() {
+    // The trailing edge belongs to both surfaces whatever point the file
+    // starts from, or one surface ends short and its chord-end pressure comes
+    // from a clamped extrapolation instead of the trailing edge itself.
+    let state = Simulation::default();
+    let contour = Airfoil::generate(&state).contour();
+    for start in [
+        0,
+        1,
+        7,
+        contour.len() / 4,
+        contour.len() / 2,
+        contour.len() - 1,
+    ] {
+        for reverse in [false, true] {
+            let mut points: Vec<_> = contour[start..]
+                .iter()
+                .chain(&contour[..start])
+                .copied()
+                .collect();
+            if reverse {
+                points.reverse();
+            }
+            let text: String = points
+                .iter()
+                .map(|p| format!("{} {}\n", p.x, p.y))
+                .collect();
+            let imported = interchange::import_airfoil(&text, "start.dat", &state)
+                .unwrap_or_else(|error| panic!("start {start} reverse {reverse}: {error}"));
+            for surface in [&imported.custom_upper, &imported.custom_lower] {
+                let surface = surface.as_ref().unwrap();
+                assert!(
+                    surface[0].x.abs() < 1e-9,
+                    "start {start} reverse {reverse}: begins at {}",
+                    surface[0].x
+                );
+                assert!(
+                    (surface.last().unwrap().x - 1.0).abs() < 1e-9,
+                    "start {start} reverse {reverse}: ends at {}",
+                    surface.last().unwrap().x
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dxf_bulge_arcs_are_expanded_into_the_contour() {
+    // A rounded leading edge drawn as a bulge segment must become geometry,
+    // not a rejection: the chord and thickness have to survive the arc.
+    let state = Simulation::default();
+    let contour = Airfoil::generate(&state).contour();
+    let nose = contour
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.x.total_cmp(&b.x))
+        .unwrap()
+        .0;
+    let mut body = format!("0\nLWPOLYLINE\n90\n{}\n70\n1\n", contour.len());
+    for (i, point) in contour.iter().enumerate() {
+        body.push_str(&format!("10\n{}\n20\n{}\n", point.x, point.y));
+        // Replace the two segments across the nose with a single arc.
+        if i == nose {
+            body.push_str("42\n-0.42\n");
+        }
+    }
+    let text = format!("0\nSECTION\n2\nENTITIES\n{body}0\nENDSEC\n0\nEOF\n");
+    let imported = interchange::import_airfoil(&text, "bulge.dxf", &state).unwrap();
+    let upper = imported.custom_upper.as_ref().unwrap();
+    let lower = imported.custom_lower.as_ref().unwrap();
+    assert!(upper.len() > contour.len() / 2, "arc produced no points");
+    assert!((upper[0].x - 0.0).abs() < 1e-12 && (upper.last().unwrap().x - 1.0).abs() < 1e-12);
+    let thickness = upper
+        .iter()
+        .zip(lower)
+        .map(|(u, l)| u.y - l.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        (thickness - state.thickness / 100.0).abs() < 0.01,
+        "thickness {thickness}"
+    );
     Analysis::new(imported).unwrap();
-    let unsupported = text.replace("0\nLWPOLYLINE\n", "0\nARC\n");
-    assert!(interchange::import_airfoil(&unsupported, "arc.dxf", &state).is_err());
 }
 
 #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "glenn-extended"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["nesfe"]
@@ -13,12 +13,18 @@ eframe = { version = "0.33.3", default-features = false, features = ["default_fo
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.30"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles", "dx12", "metal"] }
+
+[features]
+default = ["audio"]
+# Tunnel audio needs a system sound library (ALSA headers on Linux). Numerics,
+# file formats and their tests build and run without it.
+audio = ["dep:cpal"]
 
 [profile.dev]
 debug = 0

@@ -1,15 +1,32 @@
 //! Optional procedural tunnel audio. The callback never locks or allocates.
+//!
+//! Without the `audio` feature the checkbox reports that the build has no
+//! sound backend, so a desktop build needs no ALSA development package.
+#[cfg(not(feature = "audio"))]
+pub struct TunnelAudio;
+#[cfg(not(feature = "audio"))]
+impl TunnelAudio {
+    pub fn start() -> Result<Self, String> {
+        Err("Сборка без звука: пересоберите с функцией «audio»".into())
+    }
+    pub fn update(&self, _velocity: f64, _stall: f64, _volume: f32) {}
+}
+
+#[cfg(feature = "audio")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(feature = "audio")]
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 
+#[cfg(feature = "audio")]
 pub struct TunnelAudio {
     _stream: cpal::Stream,
     gain: Arc<AtomicU32>,
     buffet: Arc<AtomicU32>,
 }
+#[cfg(feature = "audio")]
 impl TunnelAudio {
     pub fn start() -> Result<Self, String> {
         let device = cpal::default_host()
@@ -41,6 +58,7 @@ impl TunnelAudio {
             .store((stall as f32).to_bits(), Ordering::Relaxed);
     }
 }
+#[cfg(feature = "audio")]
 fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,

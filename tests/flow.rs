@@ -182,6 +182,96 @@ fn rotating_cylinder_pressure_and_flow_share_magnus_circulation() {
 }
 
 #[test]
+fn cached_field_matches_the_exact_panel_solution_where_it_is_used() {
+    // The tunnel reads interpolated bases across the whole traced domain, so
+    // widening that cache must not let streamlines drift away from the panel
+    // solution they claim to show. Points the grid defers to exact panels
+    // (the near-surface band) are excluded, as is the solid interior.
+    let state = symmetric(7.0);
+    let analysis = Analysis::new(state.clone()).unwrap();
+    let grid = SectionGrid::new(&analysis.foil, &analysis.panel);
+    let incidence = state.alpha.to_radians();
+    let mut worst = 0.0f64;
+    let mut compared = 0;
+    for i in 0..=120 {
+        for j in 0..=60 {
+            let point = Point::new(
+                -3.55 + 10.9 * i as f64 / 120.0,
+                -1.95 + 3.9 * j as f64 / 60.0,
+            );
+            if (-0.08..1.08).contains(&point.x) {
+                let upper = glenn_extended::geometry::interpolate(&analysis.foil.upper, point.x);
+                let lower = glenn_extended::geometry::interpolate(&analysis.foil.lower, point.x);
+                if point.y < upper + 0.1 && point.y > lower - 0.1 {
+                    continue;
+                }
+            }
+            let exact = analysis.panel.velocity_at(point, state.alpha);
+            let cached = grid.velocity(&analysis.panel, point, incidence);
+            worst = worst.max((exact.x - cached.x).hypot(exact.y - cached.y));
+            compared += 1;
+        }
+    }
+    assert!(compared > 6000, "sampled only {compared} points");
+    assert!(worst < 0.01, "cached field deviates by {worst} of V∞");
+}
+
+#[test]
+fn only_inputs_the_field_reads_invalidate_a_trace() {
+    // Re-integrating hundreds of streamlines is the most expensive thing the
+    // interface does. It must happen when the flow changes and never when an
+    // unrelated parameter moves.
+    use glenn_extended::{model::Engine, physics::flow::field_fingerprint};
+    let mut analysis = Analysis::new(symmetric(6.0)).unwrap();
+    let reference = field_fingerprint(&analysis);
+    let mut unrelated = analysis.state.clone();
+    unrelated.max_thrust = 9000.0;
+    unrelated.aircraft_mass = 4200.0;
+    unrelated.fuel_mass = 600.0;
+    unrelated.tsfc = 0.00002;
+    unrelated.engine_type = Engine::Turbofan;
+    analysis.update(&unrelated).unwrap();
+    assert_eq!(
+        reference,
+        field_fingerprint(&analysis),
+        "propulsion is not flow"
+    );
+
+    // Everything the field does read, including an environment change that
+    // only reaches the wake through Mach and lift.
+    for (name, change) in [
+        (
+            "alpha",
+            (|s: &mut Simulation| s.alpha = 9.0) as fn(&mut Simulation),
+        ),
+        ("velocity", |s| s.velocity = 120.0),
+        ("altitude", |s| s.altitude = 9000.0),
+        ("chord", |s| s.chord = 2.4),
+        ("span", |s| s.span = 15.0),
+        ("sweep", |s| s.sweep = 18.0),
+        ("taper", |s| s.taper = 0.4),
+        ("twist", |s| s.twist = -4.0),
+        ("dihedral", |s| s.dihedral = 7.0),
+        ("winglets", |s| s.has_winglets = true),
+    ] {
+        let mut state = unrelated.clone();
+        change(&mut state);
+        let mut moved = Analysis::new(state).unwrap();
+        assert_ne!(
+            field_fingerprint(&analysis),
+            field_fingerprint(&moved),
+            "{name} must invalidate the traced field"
+        );
+        moved.update(&unrelated).unwrap();
+        assert_eq!(
+            field_fingerprint(&analysis),
+            field_fingerprint(&moved),
+            "{name} must be the only difference"
+        );
+    }
+}
+
+#[test]
 fn profile_thickness_and_flap_change_the_computed_flow() {
     let base = Analysis::new(symmetric(6.0)).unwrap();
     let base_grid = SectionGrid::new(&base.foil, &base.panel);
