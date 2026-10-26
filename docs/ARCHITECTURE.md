@@ -53,3 +53,7 @@ cargo run -- --screenshot artifacts/flow.png --size 1440x900 --alpha 10 --camera
 ```
 
 `--camera`: 0 — изометрия, 1 — профиль, 2 — план, 3 — торец. `--page`, `--preset`, `--scale`, `--control-tab` и `--scroll-end` позволяют проверять остальные страницы и компоновки. Для автоматического запуска на Linux используйте Xvfb и программный Vulkan-драйвер Mesa.
+
+### Зависимости DirectX на Windows
+
+В `Cargo.lock` зависимость `gpu-allocator 0.27` от `windows` должна разрешаться в `0.58`, как у `wgpu-hal 27`. Её диапазон `>=0.53, <=0.58` допускает также `0.54`, которую использует аудиобиблиотека, но COM-типы разных версий несовместимы. При обновлении зависимостей проверяйте `cargo tree --locked --target x86_64-pc-windows-msvc -p gpu-allocator` и Windows-сборку; не удаляйте lockfile для обхода ошибки.
