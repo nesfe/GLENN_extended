@@ -118,11 +118,13 @@ fn zero_speed_has_no_forces_and_stationary_cylinder_has_drag() {
 #[test]
 fn geometry_is_cached_for_incidence_and_environment() {
     let mut analysis = Analysis::new(Simulation::default()).unwrap();
+    let original_mesh = analysis.mesh.vertices.clone();
     let mut state = analysis.state.clone();
     state.alpha += 3.0;
     analysis.update(&state).unwrap();
     state.planet = Planet::Mars;
     analysis.update(&state).unwrap();
+    assert_eq!(analysis.mesh.vertices, original_mesh);
     assert_eq!(analysis.geometry_rebuilds, 1);
     state.thickness += 2.0;
     analysis.update(&state).unwrap();

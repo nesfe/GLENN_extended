@@ -18,13 +18,22 @@ fn main() -> eframe::Result {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
-    eframe::run_native(
+    // Diagnostic captures must never read or write the user's window/zoom state.
+    let capture_storage = capture
+        .as_ref()
+        .map(|_| std::env::temp_dir().join(format!("glenn-capture-{}", std::process::id())));
+    let result = eframe::run_native(
         "GLENN Extended",
         eframe::NativeOptions {
             viewport,
             persist_window: capture.is_none(),
+            persistence_path: capture_storage.clone(),
             ..Default::default()
         },
         Box::new(move |creation| Ok(Box::new(ui::Workbench::new(creation, capture)))),
-    )
+    );
+    if let Some(path) = capture_storage {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    result
 }

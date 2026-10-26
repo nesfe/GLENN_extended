@@ -125,6 +125,9 @@ impl Airfoil {
                 _ => 0.85,
             };
             for point in [&mut u, &mut l] {
+                if state.profile_type == Profile::Cylinder {
+                    continue;
+                }
                 point.y -=
                     (point.x - 0.75).max(0.0) * state.flap_angle.to_radians().sin() * flap_gain;
                 point.y -= (0.15 - point.x).max(0.0) * state.slat_angle.to_radians().sin() * 0.8;
@@ -160,31 +163,20 @@ impl WingMesh {
     pub fn generate(state: &Simulation, foil: &Airfoil) -> Self {
         let contour = foil.contour();
         let n = contour.len();
-        let stations = 24;
+        let stations = 48;
+        // The export mesh is stored in aircraft coordinates. Incidence belongs
+        // to the tunnel transform, so an angle change can reuse this mesh.
+        let mut aircraft = state.clone();
+        aircraft.alpha = 0.0;
         let mut mesh = Self::default();
         for station in 0..=stations {
-            let eta = 2.0 * station as f64 / stations as f64 - 1.0;
-            let local_chord = state.chord * (1.0 - eta.abs() * (1.0 - state.taper));
-            let twist = (state.twist * eta.abs()).to_radians();
-            let span_position = eta * state.span * 0.5;
-            let winglet_height = if state.has_winglets {
-                (eta.abs() - 0.9).max(0.0) * state.span * 0.65
-            } else {
-                0.0
-            };
-            for p in &contour {
-                let x = (p.x - 0.25) * local_chord;
-                let y = p.y * local_chord;
-                mesh.vertices.push([
-                    x * twist.cos()
-                        + y * twist.sin()
-                        + span_position.abs() * state.sweep.to_radians().tan(),
-                    -x * twist.sin()
-                        + y * twist.cos()
-                        + span_position.abs() * state.dihedral.to_radians().tan()
-                        + winglet_height,
-                    span_position,
-                ]);
+            let span_position = state.span * (station as f64 / stations as f64 - 0.5);
+            let frame = SectionFrame::at(&aircraft, span_position);
+            for point in &contour {
+                // Export remains in the aircraft frame; the renderer alone
+                // applies incidence. SectionFrame is also used by stream tracing.
+                let body = frame.to_world(*point);
+                mesh.vertices.push(body.to_array());
             }
         }
         for station in 0..stations {
@@ -217,5 +209,65 @@ impl WingMesh {
             }
         }
         mesh
+    }
+}
+
+/// Rotate from the aircraft frame into the tunnel frame. The tunnel free stream
+/// always points along +X; incidence changes the wing, never the camera or air.
+pub fn body_to_world(state: &Simulation, point: glam::DVec3) -> glam::DVec3 {
+    rotate_incidence(point, state.alpha.to_radians())
+}
+
+pub fn rotate_incidence(point: glam::DVec3, angle: f64) -> glam::DVec3 {
+    let (sin, cos) = angle.sin_cos();
+    glam::DVec3::new(
+        point.x * cos + point.y * sin,
+        -point.x * sin + point.y * cos,
+        point.z,
+    )
+}
+
+/// One span station, shared by the solid geometry and the velocity field.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionFrame {
+    pub chord: f64,
+    pub incidence: f64,
+    pub origin: glam::DVec3,
+}
+impl SectionFrame {
+    pub fn at(state: &Simulation, span_position: f64) -> Self {
+        let eta = (span_position / (state.span * 0.5)).abs().min(1.0);
+        let winglet_height = if state.has_winglets {
+            ((eta - 0.88).max(0.0) / 0.12).powf(1.8) * state.span * 0.045
+        } else {
+            0.0
+        };
+        let body_origin = glam::DVec3::new(
+            span_position.abs() * state.sweep.to_radians().tan(),
+            span_position.abs() * state.dihedral.to_radians().tan() + winglet_height,
+            span_position,
+        );
+        Self {
+            chord: state.chord * (1.0 - eta * (1.0 - state.taper)),
+            incidence: (state.alpha + state.twist * eta).to_radians(),
+            origin: body_to_world(state, body_origin),
+        }
+    }
+    pub fn to_world(self, point: Point) -> glam::DVec3 {
+        self.origin
+            + rotate_incidence(
+                glam::DVec3::new((point.x - 0.25) * self.chord, point.y * self.chord, 0.0),
+                self.incidence,
+            )
+    }
+    pub fn to_section(self, world: glam::DVec3) -> Point {
+        let local = rotate_incidence(world - self.origin, -self.incidence) / self.chord;
+        Point::new(local.x + 0.25, local.y)
+    }
+    pub fn velocity_to_world(self, velocity: Point) -> glam::DVec3 {
+        rotate_incidence(
+            glam::DVec3::new(velocity.x, velocity.y, 0.0),
+            self.incidence,
+        )
     }
 }

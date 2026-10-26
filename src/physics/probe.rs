@@ -1,5 +1,4 @@
-//! Illustrative near-wing probe; not atmosphere resolved 3D flow-field solver.
-use super::aerodynamics::Analysis;
+//! Probe thermodynamics driven by the same local velocity field as tracers.
 use crate::model::Planet;
 #[derive(Debug, Clone, Copy)]
 pub struct Probe {
@@ -20,22 +19,17 @@ pub fn total_pressure_ratio(mach: f64, gamma: f64) -> f64 {
             / (gamma + 1.0)
     }
 }
-pub fn sample(analysis: &Analysis, position: [f64; 3]) -> Probe {
+/// Coordinates are in root-chord units, in the fixed tunnel frame. A probe
+/// inside the solid has no fluid reading rather than a fabricated velocity.
+pub fn sample(field: &super::flow::FlowField<'_>, position: [f64; 3]) -> Option<Probe> {
+    let analysis = field.analysis;
     let state = &analysis.state;
     let atmosphere = &analysis.atmosphere;
-    let aero = &analysis.current;
-    let [x, y, z] = position;
-    let mut ratio = 1.0;
-    if z.abs() < state.span / state.chord * 0.5 {
-        if (-0.25..=0.75).contains(&x) {
-            ratio += (0.3 + 0.2 * aero.cl) * (-4.0 * y.abs()).exp() * y.signum();
-        } else if x > 0.75 {
-            ratio -= (0.2 + 0.5 * aero.stall_fraction)
-                * (-(x - 0.75)).exp()
-                * (-(y / 0.3).powi(2)).exp();
-        }
+    let world = glam::DVec3::from_array(position) * state.chord;
+    if field.contains_solid(world) {
+        return None;
     }
-    let speed = state.velocity * ratio.clamp(0.1, 2.5);
+    let speed = state.velocity * field.velocity(world).length();
     let mach = speed / atmosphere.sound_speed;
     let dynamic_pressure = 0.5 * atmosphere.density * speed * speed;
     let static_pressure =
@@ -45,11 +39,11 @@ pub fn sample(analysis: &Analysis, position: [f64; 3]) -> Probe {
     } else {
         static_pressure * total_pressure_ratio(mach, atmosphere.gamma)
     };
-    Probe {
+    Some(Probe {
         speed,
         mach,
         static_pressure,
         total_pressure,
         dynamic_pressure,
-    }
+    })
 }

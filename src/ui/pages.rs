@@ -14,12 +14,7 @@ impl Workbench {
         }
         match self.page {
             0 => {
-                let time = if self.view.animate {
-                    ui.input(|input| input.time)
-                } else {
-                    0.0
-                };
-                tunnel::show(ui, &self.analysis, &mut self.view, time);
+                tunnel::show(ui, &self.analysis, &mut self.view, &mut self.tunnel);
                 if self.view.probe {
                     self.probe_ui(ui);
                 }
@@ -59,15 +54,18 @@ impl Workbench {
                     },
                 );
             }
-            ui.label(
-                RichText::new(if r.stall_fraction > 0.4 {
-                    "Срыв потока"
-                } else if r.stall_fraction > 0.12 {
-                    "Предсрывной режим"
-                } else {
-                    "Безотрывный режим"
-                })
-                .color(if r.stall_fraction > 0.12 { AMBER } else { CYAN }),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(if r.stall_fraction > 0.4 {
+                        "Срыв потока"
+                    } else if r.stall_fraction > 0.12 {
+                        "Предсрывной режим"
+                    } else {
+                        "Безотрывный режим"
+                    })
+                    .color(if r.stall_fraction > 0.12 { AMBER } else { CYAN }),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
     }
@@ -224,12 +222,30 @@ impl Workbench {
         ui.heading("Виртуальная трубка Пито");
         ui.horizontal_wrapped(|ui| {
             for (axis, label) in ["x/c", "y/c", "z/c"].iter().enumerate() {
-                ui.add(
-                    egui::Slider::new(&mut self.view.probe_position[axis], -5.0..=5.0).text(*label),
+                ui.allocate_ui_with_layout(
+                    Vec2::new(245.0, 30.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().slider_width = 130.0;
+                        ui.add(
+                            egui::Slider::new(&mut self.view.probe_position[axis], -5.0..=5.0)
+                                .text(*label),
+                        );
+                    },
                 );
             }
         });
-        let probe = probe::sample(&self.analysis, self.view.probe_position);
+        let Some(grid) = &self.tunnel.grid else {
+            return;
+        };
+        let field = glenn_extended::physics::flow::FlowField {
+            analysis: &self.analysis,
+            grid,
+        };
+        let Some(probe) = probe::sample(&field, self.view.probe_position) else {
+            ui.colored_label(AMBER, "Зонд внутри крыла: измерение потока недоступно.");
+            return;
+        };
         ui.label(format!(
             "V = {:.1} м/с   M = {:.3}   ps = {:.0} Па   pt = {:.0} Па   q = {:.0} Па",
             probe.speed,
@@ -238,7 +254,7 @@ impl Workbench {
             probe.total_pressure,
             probe.dynamic_pressure
         ));
-        ui.small("Локальное поле иллюстративное. Полное давление: изоэнтропическая формула / формула Рэлея за нормальным скачком.");
+        ui.small("Скорость из поля линий тока. Давление — оценка Бернулли; полное давление: изоэнтропическая формула / формула Рэлея за нормальным скачком.");
     }
     pub(super) fn files_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Проекты и обмен данными");
@@ -307,7 +323,7 @@ impl Workbench {
             ),
             (
                 "Ограничения",
-                "Cp после срыва и при M > 0,75 не валидирован. Планетарные атмосферы приближённые. Предкрылки и закрылки моделируются деформацией без разрешения щелей. Траектории частиц и виртуальный зонд иллюстративные.",
+                "Cp после срыва и при M > 0,75 не валидирован. Планетарные атмосферы приближённые. Предкрылки и закрылки моделируются деформацией без разрешения щелей. Линии тока и зонд используют единое поле: панельный расчёт сечений и приближённый концевой след. Это не решение трёхмерных уравнений Навье–Стокса. После срыва показан только средний дефицит скорости; турбулентность не рассчитывается.",
             ),
             (
                 "Что изменилось в v3",

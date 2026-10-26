@@ -3,6 +3,7 @@
 mod controls;
 mod pages;
 mod plots;
+mod render;
 mod tunnel;
 use crate::audio::TunnelAudio;
 use eframe::egui::{self, Color32, RichText, Vec2};
@@ -26,6 +27,9 @@ pub struct Capture {
     pub scale: f32,
     pub control_tab: usize,
     pub preset: usize,
+    pub scroll_end: bool,
+    pub alpha: Option<f64>,
+    pub camera: usize,
 }
 impl Capture {
     pub fn from_args(args: &[String]) -> Option<Self> {
@@ -40,6 +44,9 @@ impl Capture {
             .and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))
             .unwrap_or([1440.0, 900.0]);
         Some(Self {
+            scroll_end: args.iter().any(|arg| arg == "--scroll-end"),
+            alpha: value("--alpha").and_then(|s| s.parse().ok()),
+            camera: value("--camera").and_then(|s| s.parse().ok()).unwrap_or(0),
             control_tab: value("--control-tab")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
@@ -56,6 +63,7 @@ pub struct Workbench {
     analysis: Analysis,
     performance: Performance,
     view: tunnel::View,
+    tunnel: tunnel::Tunnel,
     page: usize,
     control_tab: usize,
     preset: usize,
@@ -94,6 +102,7 @@ fn style(ctx: &egui::Context) {
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
     style.spacing.interact_size.y = 30.0;
     style.spacing.slider_width = 150.0;
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
     style
         .text_styles
         .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
@@ -111,7 +120,7 @@ impl Workbench {
         } else {
             None
         };
-        let starting_state = capture
+        let mut starting_state = capture
             .as_ref()
             .and_then(|capture| {
                 model::presets()
@@ -120,14 +129,28 @@ impl Workbench {
             })
             .or(saved)
             .unwrap_or_default();
+        if let Some(alpha) = capture.as_ref().and_then(|c| c.alpha) {
+            starting_state.alpha = alpha;
+        }
         let mut app = Self::with_state(starting_state);
         if let Some(capture) = &capture {
             app.page = capture.page.min(6);
             app.control_tab = capture.control_tab.min(3);
             app.preset = capture.preset.min(app.presets.len() - 1);
             app.view.animate = false;
+            let cameras = [
+                (-0.65, 0.48),
+                (0.0, 0.0),
+                (0.0, std::f64::consts::FRAC_PI_2),
+                (std::f64::consts::FRAC_PI_2, 0.0),
+            ];
+            (app.view.yaw, app.view.pitch) = cameras[capture.camera.min(3)];
             creation.egui_ctx.set_zoom_factor(capture.scale);
         }
+        app.tunnel.renderer = creation
+            .wgpu_render_state
+            .clone()
+            .map(render::Renderer::new);
         app.capture = capture;
         app
     }
@@ -151,6 +174,7 @@ impl Workbench {
             analysis,
             performance,
             view: tunnel::View::default(),
+            tunnel: tunnel::Tunnel::default(),
             page: 0,
             control_tab: 0,
             preset: 0,
@@ -241,7 +265,7 @@ impl Workbench {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("GLENN").size(25.0).strong().color(CYAN));
-                    ui.label(RichText::new("EXTENDED  /  3.0").size(12.0).color(MUTED));
+                    ui.label(RichText::new("EXTENDED  /  3.1").size(12.0).color(MUTED));
                     ui.separator();
                     ui.label("Аэродинамическая лаборатория");
                     if ui.button("Открыть…").clicked() {
@@ -337,10 +361,17 @@ impl Workbench {
                     .inner_margin(16),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
+                let mut scroll = egui::ScrollArea::vertical()
                     .id_salt(("page-scroll", self.page))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.active_page(ui));
+                    .auto_shrink([false, false]);
+                if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.scroll_end)
+                {
+                    scroll = scroll.stick_to_bottom(true);
+                }
+                scroll.show(ui, |ui| self.active_page(ui));
             });
         self.regions.push(("central", central.response.rect));
         self.recalculate();
@@ -411,6 +442,10 @@ impl eframe::App for Workbench {
             }
         }
     }
+    fn persist_egui_memory(&self) -> bool {
+        self.capture.is_none()
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if self.capture.is_none()
             && let Ok(text) = interchange::save_project(&self.state)
@@ -436,10 +471,11 @@ mod tests {
             let ctx = egui::Context::default();
             style(&ctx);
             let mut app = Workbench::with_state(Simulation::default());
-            for scenario in 0..10 {
-                let page = scenario.min(6);
+            for scenario in 0..11 {
+                let page = if scenario == 10 { 0 } else { scenario.min(6) };
+                app.view.probe = scenario == 10;
                 app.page = page;
-                app.control_tab = scenario.saturating_sub(6);
+                app.control_tab = scenario.saturating_sub(6).min(3);
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -448,16 +484,19 @@ mod tests {
                     ..Default::default()
                 };
                 let _ = ctx.run(input, |ctx| app.draw(ctx));
+                // Pixel rounding at fractional DPI can move an edge by less
+                // than one logical pixel; larger overflow is a layout failure.
+                const EDGE_TOLERANCE: f32 = 1.0;
                 for (name, rect) in &app.regions {
                     assert!(
                         rect.width() > 0.0 && rect.height() > 0.0,
                         "{name}: {width}x{height}"
                     );
                     assert!(
-                        rect.min.x >= -0.1
-                            && rect.min.y >= -0.1
-                            && rect.max.x <= width + 0.1
-                            && rect.max.y <= height + 0.1,
+                        rect.min.x >= -EDGE_TOLERANCE
+                            && rect.min.y >= -EDGE_TOLERANCE
+                            && rect.max.x <= width + EDGE_TOLERANCE
+                            && rect.max.y <= height + EDGE_TOLERANCE,
                         "{name} {rect:?}, page {page}, {width}x{height}"
                     );
                 }

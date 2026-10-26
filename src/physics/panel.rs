@@ -18,6 +18,7 @@ pub struct PanelModel {
     upper_count: usize,
     tangent_x: Vec<f64>,
     tangent_y: Vec<f64>,
+    strengths: Vec<[f64; 2]>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct Pressure {
@@ -147,16 +148,67 @@ impl PanelModel {
             upper_count: foil.upper.len() - 1,
             tangent_x,
             tangent_y,
+            strengths,
         })
     }
+    /// Velocity response to unit free streams along the section x and y axes.
+    /// Uses the same source/vortex strengths as Cp, including the Kutta condition.
+    /// Coordinates and velocities are dimensionless (chord and free-stream speed).
+    pub fn velocity_basis(&self, point: Point) -> [Point; 2] {
+        let mut velocity = [Point::new(1.0, 0.0), Point::new(0.0, 1.0)];
+        let circulation = self.strengths[self.panels.len()];
+        for (index, panel) in self.panels.iter().enumerate() {
+            let source = source_velocity(panel, point);
+            for axis in 0..2 {
+                velocity[axis].x +=
+                    source.x * self.strengths[index][axis] - source.y * circulation[axis];
+                velocity[axis].y +=
+                    source.y * self.strengths[index][axis] + source.x * circulation[axis];
+            }
+        }
+        velocity
+    }
+
+    pub fn velocity_at(&self, point: Point, alpha_degrees: f64) -> Point {
+        let [x_response, y_response] = self.velocity_basis(point);
+        let (sin, cos) = alpha_degrees.to_radians().sin_cos();
+        Point::new(
+            x_response.x * cos + y_response.x * sin,
+            x_response.y * cos + y_response.y * sin,
+        )
+    }
+
     pub fn evaluate(&self, alpha_degrees: f64, mach: f64) -> Pressure {
-        let alpha = alpha_degrees.to_radians();
-        let (sin, cos) = alpha.sin_cos();
-        // Subsonic correction is bounded; transonic Cp is explicitly marked approximate in UI.
+        let (sin, cos) = alpha_degrees.to_radians().sin_cos();
+        let speeds: Vec<_> = self
+            .tangent_x
+            .iter()
+            .zip(&self.tangent_y)
+            .map(|(x, y)| x * cos + y * sin)
+            .collect();
+        self.pressure_from_speeds(alpha_degrees, mach, &speeds)
+    }
+
+    /// Analytic circular-cylinder solution; rotation changes both Cp and flow.
+    /// Positive spin corresponds to clockwise circulation and positive lift.
+    pub fn cylinder_pressure(&self, alpha_degrees: f64, spin_ratio: f64) -> Pressure {
+        let speeds: Vec<_> = self
+            .panels
+            .iter()
+            .map(|panel| {
+                let theta = panel.center.y.atan2(panel.center.x - 0.5);
+                -2.0 * (theta - alpha_degrees.to_radians()).sin() - spin_ratio
+            })
+            .collect();
+        self.pressure_from_speeds(alpha_degrees, 0.0, &speeds)
+    }
+    fn pressure_from_speeds(&self, alpha_degrees: f64, mach: f64, speeds: &[f64]) -> Pressure {
+        let (sin, cos) = alpha_degrees.to_radians().sin_cos();
+        // Bounded Prandtl–Glauert correction, not a transonic solution.
         let beta = (1.0 - mach.min(0.8).powi(2)).sqrt();
         let mut out = Pressure::default();
         for (i, p) in self.panels.iter().enumerate() {
-            let velocity = self.tangent_x[i] * cos + self.tangent_y[i] * sin;
+            let velocity = speeds[i];
             let cp = (1.0 - velocity * velocity) / beta;
             let (fx, fy) = (-cp * p.length * p.normal.x, -cp * p.length * p.normal.y);
             out.lift += -fx * sin + fy * cos;
@@ -172,4 +224,20 @@ impl PanelModel {
         out.lower.sort_by(|a, b| a.x.total_cmp(&b.x));
         out
     }
+}
+
+/// Unit-speed potential flow around a circular cylinder of radius 0.5 chord.
+/// The doublet enforces zero radial velocity and circulation supplies Magnus lift.
+pub fn cylinder_velocity(point: Point, incidence: f64, spin_ratio: f64) -> Point {
+    let x = point.x - 0.5;
+    let y = point.y;
+    let radius = x.hypot(y).max(1e-8);
+    let theta = y.atan2(x);
+    let radial = (theta - incidence).cos() * (1.0 - 0.25 / (radius * radius));
+    let tangential =
+        -(theta - incidence).sin() * (1.0 + 0.25 / (radius * radius)) - spin_ratio * 0.5 / radius;
+    Point::new(
+        radial * theta.cos() - tangential * theta.sin(),
+        radial * theta.sin() + tangential * theta.cos(),
+    )
 }

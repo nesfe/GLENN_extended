@@ -47,7 +47,7 @@ pub struct Analysis {
     pub atmosphere: Atmosphere,
     pub current: AeroResult,
     pub polar: Vec<(f64, AeroResult)>,
-    panel: PanelModel,
+    pub panel: PanelModel,
     pub geometry_rebuilds: usize,
 }
 impl Analysis {
@@ -80,7 +80,16 @@ impl Analysis {
             self.panel = PanelModel::prepare(&foil)?;
             self.geometry_rebuilds += 1;
         }
-        self.mesh = WingMesh::generate(state, &foil);
+        let planform_changed = self.state.chord != state.chord
+            || self.state.span != state.span
+            || self.state.sweep != state.sweep
+            || self.state.dihedral != state.dihedral
+            || self.state.twist != state.twist
+            || self.state.taper != state.taper
+            || self.state.has_winglets != state.has_winglets;
+        if foil != self.foil || planform_changed {
+            self.mesh = WingMesh::generate(state, &foil);
+        }
         self.foil = foil;
         self.atmosphere = atmosphere::calculate(state);
         self.current = solve(state, &self.atmosphere, &self.panel);
@@ -127,7 +136,7 @@ fn solve(state: &Simulation, atmosphere: &Atmosphere, panel: &PanelModel) -> Aer
     } else {
         1.0 / (1.0 + (-(state.alpha.abs() - stall_angle) * 1.1).exp())
     };
-    let pressure = panel.evaluate(state.alpha, mach * sweep.cos());
+    let mut pressure = panel.evaluate(state.alpha, mach * sweep.cos());
     let effective_pressure = panel.evaluate(state.alpha + 0.4 * state.twist, mach * sweep.cos());
     let section_slope = 2.0 * PI / (1.0 - (mach * sweep.cos()).min(0.8).powi(2)).sqrt();
     let finite_wing_factor =
@@ -135,6 +144,9 @@ fn solve(state: &Simulation, atmosphere: &Atmosphere, panel: &PanelModel) -> Aer
     let spin_ratio = (state.cylinder_rpm * 2.0 * PI / 60.0 * state.mean_chord() * 0.5
         / state.velocity.max(0.1))
     .clamp(-4.0, 4.0);
+    if state.profile_type == Profile::Cylinder {
+        pressure = panel.cylinder_pressure(state.alpha, spin_ratio);
+    }
     let subsonic_cl = (1.0 - stall_fraction) * effective_pressure.lift * finite_wing_factor
         + stall_fraction * 1.95 * alpha.sin() * alpha.cos();
     let supersonic_cl = 4.0 * alpha / (mach * mach - 1.0).max(0.1).sqrt();
