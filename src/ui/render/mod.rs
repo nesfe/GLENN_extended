@@ -37,6 +37,7 @@ pub struct Renderer {
     binding: wgpu::BindGroup,
     target: Option<Target>,
     vertices: Option<wgpu::Buffer>,
+    capacity: u64,
     solid_count: u32,
     total_count: u32,
 }
@@ -111,18 +112,32 @@ impl Renderer {
             binding,
             target: None,
             vertices: None,
+            capacity: 0,
             solid_count: 0,
             total_count: 0,
         }
     }
+    /// Reuse the vertex buffer while the scene still fits. A dense tunnel scene
+    /// runs to tens of megabytes, and reallocating it on every incidence step
+    /// stalls the very frame that should be showing the new flow. Growth is
+    /// over-allocated so a slightly larger scene does not force a new buffer.
     pub fn upload(&mut self, scene: &Scene) {
-        self.vertices = Some(self.state.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
+        let data: &[u8] = bytemuck::cast_slice(&scene.vertices);
+        let required = (data.len() as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        if self.capacity < required {
+            self.capacity = (required * 3 / 2).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+            self.vertices = Some(self.state.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Wing and integrated streamlines"),
-                contents: bytemuck::cast_slice(&scene.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            },
-        ));
+                size: self.capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        // Only the counted prefix is ever drawn, so a longer buffer keeps no
+        // stale geometry visible.
+        if let Some(buffer) = &self.vertices {
+            self.state.queue.write_buffer(buffer, 0, data);
+        }
         self.solid_count = scene.solid_count;
         self.total_count = scene.vertices.len() as u32;
     }

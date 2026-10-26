@@ -131,17 +131,26 @@ impl Camera {
         )
     }
 }
+/// Display switches that change uploaded vertex colours but no numerical result.
+type Style = (bool, bool, bool, bool, usize);
+/// Traced-field inputs plus the requested line density.
+type FlowKey = ([f64; 13], usize);
+
 /// Numerical and GPU caches are independent of camera movement and animation.
+///
+/// Tracing is keyed on the inputs the field actually reads, never on the whole
+/// `Simulation`: a thrust, mass or fuel slider must not re-integrate hundreds
+/// of streamlines. The uploaded scene additionally depends on surface Mach and
+/// on the display switches.
 #[derive(Default)]
 pub struct Tunnel {
     pub renderer: Option<super::render::Renderer>,
     pub grid: Option<glenn_extended::physics::flow::SectionGrid>,
-    state: Option<glenn_extended::model::Simulation>,
     paths: Vec<glenn_extended::physics::flow::Streamline>,
-    density: usize,
+    flow: Option<FlowKey>,
+    scene: Option<(FlowKey, f64, Style)>,
     clock: f64,
     last_time: Option<f64>,
-    style: Option<(bool, bool, bool, bool, usize)>,
 }
 pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mut Tunnel) {
     ui.horizontal_wrapped(|ui| {
@@ -238,6 +247,8 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
         .min(rect.height() as f64 * 0.50 / extent(1).max(state.chord * 0.85))
         * view.zoom;
     if let Some(renderer) = &mut tunnel.renderer {
+        // A new airfoil invalidates both the sampled bases and everything traced
+        // or uploaded from them, so neither cache may survive on an equal key.
         if tunnel
             .grid
             .as_ref()
@@ -247,28 +258,35 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
                 &analysis.foil,
                 &analysis.panel,
             ));
-            tunnel.state = None;
+            tunnel.flow = None;
+            tunnel.scene = None;
         }
-        if tunnel.state.as_ref() != Some(state) || tunnel.density != view.density {
+        let flow = (
+            glenn_extended::physics::flow::field_fingerprint(analysis),
+            view.density,
+        );
+        if tunnel.flow != Some(flow) {
             let field = glenn_extended::physics::flow::FlowField {
                 analysis,
                 grid: tunnel.grid.as_ref().unwrap(),
             };
             tunnel.paths = field.streamlines(view.density);
-            tunnel.state = Some(state.clone());
-            tunnel.density = view.density;
-            tunnel.style = None;
+            tunnel.flow = Some(flow);
         }
-        let style = (
-            view.streamlines,
-            view.vortices,
-            view.pressure,
-            view.wireframe,
-            view.palette,
+        let scene = (
+            flow,
+            aero.mach,
+            (
+                view.streamlines,
+                view.vortices,
+                view.pressure,
+                view.wireframe,
+                view.palette,
+            ),
         );
-        if tunnel.style != Some(style) {
+        if tunnel.scene != Some(scene) {
             renderer.upload(&super::render::Scene::new(analysis, &tunnel.paths, view));
-            tunnel.style = Some(style);
+            tunnel.scene = Some(scene);
         }
         let pixels = ui.ctx().pixels_per_point();
         let texture = renderer.render(

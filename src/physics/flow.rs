@@ -9,12 +9,46 @@ use crate::{
 use glam::DVec3;
 use std::f64::consts::PI;
 
-const GRID_X: usize = 121;
-const GRID_Y: usize = 81;
-const X_MIN: f64 = -2.0;
-const X_MAX: f64 = 4.0;
-const Y_MIN: f64 = -1.8;
-const Y_MAX: f64 = 1.8;
+// The cached domain covers the region the tracer actually visits: the rake is
+// injected about three chords upstream and lines are followed roughly four
+// chords past the trailing edge. A point outside still gets the exact panel
+// sum, but that costs ~15x a cached lookup, so leaving the grid too small made
+// a third of all samples take the slow path. Cell size is ~0.05 x 0.045 chord.
+const GRID_X: usize = 221;
+const GRID_Y: usize = 89;
+const X_MIN: f64 = -3.6;
+const X_MAX: f64 = 7.4;
+const Y_MIN: f64 = -2.0;
+const Y_MAX: f64 = 2.0;
+
+/// Split an index range across the available cores and concatenate the chunk
+/// results in order. Every chunk is independent, so the output is identical to
+/// a serial run; only the wall-clock cost changes.
+fn parallel_chunks<T: Send>(
+    total: usize,
+    body: impl Fn(std::ops::Range<usize>) -> Vec<T> + Sync,
+) -> Vec<T> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(total);
+    if threads < 2 {
+        return body(0..total);
+    }
+    let span = total.div_ceil(threads);
+    let body = &body;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|i| {
+                let range = (i * span).min(total)..((i + 1) * span).min(total);
+                scope.spawn(move || body(range))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("flow worker panicked"))
+            .collect()
+    })
+}
 
 /// Two velocity bases are sampled once per airfoil. Changing incidence combines
 /// these bases instead of solving or sampling thousands of panels again.
@@ -24,16 +58,20 @@ pub struct SectionGrid {
 }
 impl SectionGrid {
     pub fn new(foil: &Airfoil, panel: &PanelModel) -> Self {
-        let mut bases = Vec::with_capacity(GRID_X * GRID_Y);
-        for row in 0..GRID_Y {
-            for column in 0..GRID_X {
-                let point = Point::new(
-                    X_MIN + (X_MAX - X_MIN) * column as f64 / (GRID_X - 1) as f64,
-                    Y_MIN + (Y_MAX - Y_MIN) * row as f64 / (GRID_Y - 1) as f64,
-                );
-                bases.push(panel.velocity_basis(point));
+        // Row-major, matching the bilinear lookup below.
+        let bases = parallel_chunks(GRID_Y, |rows| {
+            let mut out = Vec::with_capacity(rows.len() * GRID_X);
+            for row in rows {
+                for column in 0..GRID_X {
+                    let point = Point::new(
+                        X_MIN + (X_MAX - X_MIN) * column as f64 / (GRID_X - 1) as f64,
+                        Y_MIN + (Y_MAX - Y_MIN) * row as f64 / (GRID_Y - 1) as f64,
+                    );
+                    out.push(panel.velocity_basis(point));
+                }
             }
-        }
+            out
+        });
         Self {
             foil: foil.clone(),
             bases,
@@ -68,6 +106,31 @@ impl SectionGrid {
         }
         result
     }
+}
+
+/// Every input the traced field reads, in one comparable value. Equal
+/// fingerprints give identical streamlines, so a caller can keep the previous
+/// trace when an unrelated parameter moved: engine, mass, fuel and display
+/// settings never enter the flow solution. Derived aerodynamic outputs are
+/// included because the wake and the trailing filaments read them, which is
+/// how an environment change reaches the field through Mach and lift.
+pub fn field_fingerprint(analysis: &Analysis) -> [f64; 13] {
+    let state = &analysis.state;
+    [
+        state.chord,
+        state.span,
+        state.alpha,
+        state.twist,
+        state.taper,
+        state.sweep,
+        state.dihedral,
+        f64::from(state.has_winglets),
+        state.velocity,
+        state.cylinder_rpm,
+        f64::from(state.profile_type == crate::model::Profile::Cylinder),
+        analysis.current.cl,
+        analysis.current.stall_fraction,
+    ]
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -242,6 +305,25 @@ impl FlowField<'_> {
     }
 
     pub fn streamlines(&self, density: usize) -> Vec<Streamline> {
+        let seeds = self.seeds(density);
+        // Each trace reads the shared field and writes nothing, so integrating
+        // them on several cores gives the same lines in the same order.
+        parallel_chunks(seeds.len(), |range| {
+            seeds[range]
+                .iter()
+                .map(|&(seed, vortex)| self.trace(seed, vortex))
+                .collect()
+        })
+        .into_iter()
+        // A line that stops within a few steps of its seed carries no
+        // information; tip strands are kept so the vortex core stays visible.
+        .filter(|line| line.vortex || line.samples.len() > 12)
+        .collect()
+    }
+
+    /// Injection points for the tracer rake and the tip strands, in the order
+    /// they are drawn.
+    fn seeds(&self, density: usize) -> Vec<(DVec3, bool)> {
         let state = &self.analysis.state;
         let mut paths = Vec::new();
         let span_lanes = 5 + density * 2;
@@ -266,10 +348,7 @@ impl FlowField<'_> {
                     z.abs() * state.dihedral.to_radians().tan() + layer * state.chord,
                     z,
                 );
-                let line = self.trace(seed, false);
-                if line.samples.len() > 12 {
-                    paths.push(line);
-                }
+                paths.push((seed, false));
             }
         }
         if self.tip_circulation().abs() > state.velocity * state.chord * 0.01 {
@@ -283,7 +362,7 @@ impl FlowField<'_> {
                             phase.sin() * state.chord * 0.11,
                             phase.cos() * state.chord * 0.11,
                         );
-                    paths.push(self.trace(seed, true));
+                    paths.push((seed, true));
                 }
             }
         }

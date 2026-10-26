@@ -181,11 +181,16 @@ fn solve(state: &Simulation, atmosphere: &Atmosphere, panel: &PanelModel) -> Aer
     } else {
         pressure.moment
     };
-    let center_of_pressure = if cl.abs() > 0.01 {
-        0.25 - cm / cl
-    } else {
-        0.25
-    };
+    // Chordwise balance point of the section whose Cp is drawn. Moment and lift
+    // must come from that same distribution: dividing the section moment by the
+    // finite-wing lift coefficient made the marker depend on span and taper,
+    // which cannot move where a section's own resultant acts.
+    let center_of_pressure =
+        if state.profile_type == Profile::Cylinder || pressure.lift.abs() < 0.01 {
+            0.25
+        } else {
+            0.25 - pressure.moment / pressure.lift
+        };
     // Normalize numerical span loading to total lift. Signed lift is preserved.
     let stations = 65;
     let spacing = state.span / (stations - 1) as f64;
