@@ -17,9 +17,18 @@ pub struct Vertex {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub struct LineInstance {
+    start: [f32; 4],
+    end: [f32; 4],
+    color: [f32; 4],
+    data: [f32; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
     camera: [[f32; 4]; 4],
     clock: [f32; 4],
+    viewport: [f32; 4],
 }
 
 struct Target {
@@ -33,6 +42,10 @@ pub struct Renderer {
     state: RenderState,
     opaque: wgpu::RenderPipeline,
     transparent: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    lines: Option<wgpu::Buffer>,
+    line_capacity: u64,
+    line_count: u32,
     uniform: wgpu::Buffer,
     binding: wgpu::BindGroup,
     target: Option<Target>,
@@ -79,34 +92,76 @@ impl Renderer {
             bind_group_layouts: &[&binding_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = |transparent| {
+        const SURFACE_ATTRS: [wgpu::VertexAttribute; 4] =
+            wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x4,3=>Float32x4];
+        const LINE_ATTRS: [wgpu::VertexAttribute; 4] =
+            wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4];
+        let pipeline = |transparent, lines| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(if transparent { "Flow with wing occlusion" } else { "Wing surface" }),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x4,3=>Float32x4],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: if transparent { Some(wgpu::BlendState::ALPHA_BLENDING) } else { None }, write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: !transparent,
-                depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: 4, ..Default::default() },
-            multiview: None, cache: None,
-        })
+                label: Some(if transparent {
+                    "Flow with wing occlusion"
+                } else {
+                    "Wing surface"
+                }),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(if lines { "vs_line" } else { "vs_main" }),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: if lines {
+                            std::mem::size_of::<LineInstance>() as u64
+                        } else {
+                            std::mem::size_of::<Vertex>() as u64
+                        },
+                        step_mode: if lines {
+                            wgpu::VertexStepMode::Instance
+                        } else {
+                            wgpu::VertexStepMode::Vertex
+                        },
+                        attributes: if lines { &LINE_ATTRS } else { &SURFACE_ATTRS },
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: if transparent {
+                            Some(wgpu::BlendState::ALPHA_BLENDING)
+                        } else {
+                            None
+                        },
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: !transparent,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 4,
+                    ..Default::default()
+                },
+                multiview: None,
+                cache: None,
+            })
         };
         Self {
-            opaque: pipeline(false),
-            transparent: pipeline(true),
+            opaque: pipeline(false, false),
+            transparent: pipeline(true, false),
+            line_pipeline: pipeline(true, true),
+            lines: None,
+            line_capacity: 0,
+            line_count: 0,
             state,
             uniform,
             binding,
@@ -138,6 +193,23 @@ impl Renderer {
         if let Some(buffer) = &self.vertices {
             self.state.queue.write_buffer(buffer, 0, data);
         }
+        let line_data: &[u8] = bytemuck::cast_slice(&scene.lines);
+        let required = line_data.len() as u64;
+        if required > self.line_capacity {
+            self.line_capacity = required.next_power_of_two();
+            self.lines = Some(self.state.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Flow segment instances"),
+                size: self.line_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if let Some(buffer) = &self.lines
+            && !line_data.is_empty()
+        {
+            self.state.queue.write_buffer(buffer, 0, line_data);
+        }
+        self.line_count = scene.lines.len() as u32;
         self.solid_count = scene.solid_count;
         self.total_count = scene.vertices.len() as u32;
     }
@@ -211,6 +283,7 @@ impl Renderer {
             bytemuck::bytes_of(&Uniforms {
                 camera: camera.to_cols_array_2d(),
                 clock: [time, eye.x, eye.y, eye.z],
+                viewport: [size[0] as f32, size[1] as f32, 0.0, 0.0],
             }),
         );
         let target = self.target.as_ref().unwrap();
@@ -253,6 +326,12 @@ impl Renderer {
                 pass.draw(0..self.solid_count, 0..1);
                 pass.set_pipeline(&self.transparent);
                 pass.draw(self.solid_count..self.total_count, 0..1);
+            }
+            if let Some(lines) = &self.lines {
+                pass.set_bind_group(0, &self.binding, &[]);
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, lines.slice(..));
+                pass.draw(0..6, 0..self.line_count);
             }
         }
         self.state.queue.submit([encoder.finish()]);

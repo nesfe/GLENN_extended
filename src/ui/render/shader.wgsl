@@ -1,6 +1,7 @@
 struct Uniforms {
     camera: mat4x4<f32>,
     clock: vec4<f32>,
+    viewport: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 struct Input {
@@ -42,4 +43,27 @@ struct Output {
         color = vec4(mix(color.rgb, vec3(0.9, 0.99, 1.0), pulse * 0.8), color.a * (0.38 + 0.62 * pulse));
     }
     return color;
+}
+
+struct LineInput {
+    @location(0) start: vec4<f32>,
+    @location(1) end: vec4<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) data: vec4<f32>,
+};
+@vertex fn vs_line(input: LineInput, @builtin(vertex_index) index: u32) -> Output {
+    let corners = array<vec2<f32>,6>(vec2(0.0,-1.0),vec2(1.0,-1.0),vec2(1.0,1.0),vec2(0.0,-1.0),vec2(1.0,1.0),vec2(0.0,1.0));
+    let corner=corners[index];
+    let a=uniforms.camera*vec4(input.start.xyz,1.0);
+    let b=uniforms.camera*vec4(input.end.xyz,1.0);
+    let delta=(b.xy/b.w-a.xy/a.w)*uniforms.viewport.xy;
+    let normal=vec2(-delta.y,delta.x)/max(length(delta),1e-8);
+    let scale=length(vec3(uniforms.camera[0].x,uniforms.camera[1].x,uniforms.camera[2].x));
+    let width=clamp(input.data.x*scale*uniforms.viewport.x,0.8,4.0);
+    var position=mix(a,b,corner.x);
+    position=vec4(position.xy+normal*corner.y*width/uniforms.viewport.xy*position.w,position.zw);
+    var out:Output;
+    out.position=position; out.normal=vec3(0.0,1.0,0.0);out.color=input.color;
+    out.data=vec4(input.data.y,mix(input.start.w,input.end.w,corner.x),0.0,0.0);
+    return out;
 }

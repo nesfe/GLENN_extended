@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write as _, path::Path};
-pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 struct Project {
     format_version: u32,
@@ -58,14 +58,25 @@ pub fn load_project(text: &str) -> Result<(Simulation, Option<String>), String> 
 pub fn read_text(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if text.len() as u64 > MAX_FILE_BYTES {
-        return Err("Максимальный размер файла — 2 МБ".into());
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err("Максимальный размер файла — 16 МБ".into());
     }
-    Ok(text)
+    // Legacy CAD text strings may use ANSI code pages. Group codes and geometry
+    // are ASCII; lossy decoding affects only names/comments, never numbers.
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("dxf"))
+    {
+        Ok(String::from_utf8_lossy(&bytes)
+            .trim_start_matches('\u{feff}')
+            .to_string())
+    } else {
+        String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
 }
 
 /// Largest surface point count kept after import. A CAD export can hold tens
@@ -213,7 +224,7 @@ fn dxf_pairs(text: &str) -> Result<Vec<(i32, &str)>, String> {
         return Err("DXF в двоичном формате: сохраните как ASCII DXF".into());
     }
     let mut pairs = Vec::new();
-    let mut lines = text.lines();
+    let mut lines = text.trim_start_matches('\u{feff}').lines();
     while let Some(code) = lines.next() {
         let code = code.trim();
         if code.is_empty() {
@@ -325,41 +336,39 @@ impl Outline {
         out
     }
 
-    /// Points along a SPLINE. Fit points lie on the curve and are used as they
-    /// are; otherwise the control polygon is evaluated.
+    /// Evaluate the curve defined by its control points, knots and weights.
     fn sampled_spline(&self) -> Result<Vec<Point>, String> {
-        if self.fit.len() >= 12 {
-            return Ok(self.fit.clone());
+        // Control points + knots define the curve. Fit points are not a
+        // substitute for it (nor can unspecified endpoint tangents be guessed).
+        if self.points.len() <= self.degree {
+            return Err("DXF: SPLINE без полного набора контрольных точек и узлов. Сохраните сплайн с контрольными точками либо полилинией.".into());
         }
-        let degree = self.degree.clamp(1, 7);
-        if self.points.len() <= degree {
-            return Ok(Vec::new());
-        }
-        if self.weights.len() > 1
-            && self
-                .weights
-                .iter()
-                .any(|weight| (weight - self.weights[0]).abs() > 1e-9)
-        {
-            return Err("DXF: рациональный сплайн с переменными весами не поддерживается".into());
+        let degree = self.degree;
+        if !(1..=7).contains(&degree) {
+            return Err("DXF: степень SPLINE должна быть 1…7".into());
         }
         let expected = self.points.len() + degree + 1;
-        // A clamped uniform vector is what CAD writes for an open spline, and
-        // keeps a truncated knot list from distorting the profile.
-        let knots: Vec<f64> = if self.knots.len() == expected {
-            self.knots.clone()
-        } else {
-            let interior = self.points.len() - degree;
-            (0..expected)
-                .map(|i| i.saturating_sub(degree).min(interior) as f64)
-                .collect()
-        };
-        let (first, last) = (knots[degree], knots[self.points.len()]);
-        let samples = 400;
+        if self.knots.len() != expected || self.knots.windows(2).any(|k| k[0] > k[1]) {
+            return Err("DXF: неверное число или порядок узлов SPLINE".into());
+        }
+        if !self.weights.is_empty()
+            && (self.weights.len() != self.points.len() || self.weights.iter().any(|w| *w <= 0.0))
+        {
+            return Err("DXF: некорректные веса рационального SPLINE".into());
+        }
+        let (first, last) = (self.knots[degree], self.knots[self.points.len()]);
+        if last <= first {
+            return Err("DXF: нулевой интервал SPLINE".into());
+        }
+        let samples = (self.points.len() * 8).clamp(400, 8192);
         Ok((0..=samples)
             .map(|i| {
                 let t = first + (last - first) * i as f64 / samples as f64;
-                de_boor(degree, &knots, &self.points, t.min(last))
+                if self.weights.is_empty() {
+                    de_boor(degree, &self.knots, &self.points, t)
+                } else {
+                    rational_de_boor(degree, &self.knots, &self.points, &self.weights, t)
+                }
             })
             .collect())
     }
@@ -369,14 +378,17 @@ impl Outline {
         let points = match self.kind.as_str() {
             "LWPOLYLINE" | "POLYLINE" => self.tessellated(),
             "SPLINE" => self.sampled_spline()?,
+            "LINE" if !self.points.is_empty() && !self.fit.is_empty() => {
+                vec![self.points[0], self.fit[0]]
+            }
             _ => return Ok(None),
         };
-        Ok((points.len() >= 12).then_some(points))
+        Ok((points.len() >= 2).then_some(points))
     }
 }
 
 /// Read every contour-bearing entity of the ENTITIES section in file order.
-fn dxf_outlines(pairs: &[(i32, &str)]) -> Vec<Outline> {
+fn dxf_outlines(pairs: &[(i32, &str)]) -> Result<Vec<Outline>, String> {
     let mut out = Vec::new();
     let mut current = Outline::default();
     let mut section = "";
@@ -407,6 +419,17 @@ fn dxf_outlines(pairs: &[(i32, &str)]) -> Vec<Outline> {
         }
         if section != "ENTITIES" {
             continue;
+        }
+        if matches!(
+            current.kind.as_str(),
+            "LINE" | "LWPOLYLINE" | "POLYLINE" | "SPLINE"
+        ) && matches!(code, 10 | 20 | 11 | 21 | 40 | 41 | 42)
+            && value.parse::<f64>().ok().is_none_or(|v| !v.is_finite())
+        {
+            return Err(format!(
+                "DXF: неверное число в {} (код {code}): {value}",
+                current.kind
+            ));
         }
         let number = || value.parse::<f64>().ok().filter(|v| v.is_finite());
         match code {
@@ -441,13 +464,19 @@ fn dxf_outlines(pairs: &[(i32, &str)]) -> Vec<Outline> {
                     current.weights.push(weight);
                 }
             }
-            70 => current.closed = value.parse::<i32>().is_ok_and(|flags| flags & 1 != 0),
-            71 => current.degree = value.parse::<usize>().unwrap_or(3),
+            70 if !current.vertices_started => {
+                current.closed = value.parse::<i32>().is_ok_and(|flags| flags & 1 != 0)
+            }
+            71 if current.kind == "SPLINE" => {
+                current.degree = value
+                    .parse::<usize>()
+                    .map_err(|_| "DXF: неверная степень SPLINE")?
+            }
             _ => {}
         }
     }
     out.push(current);
-    out
+    Ok(out)
 }
 
 /// The profile contour of an ASCII DXF drawing.
@@ -458,29 +487,121 @@ fn dxf_outlines(pairs: &[(i32, &str)]) -> Vec<Outline> {
 /// separates it from a small flap box or a leader.
 fn dxf_points(text: &str) -> Result<Vec<Point>, String> {
     let pairs = dxf_pairs(text)?;
-    let mut loops: Vec<Vec<Point>> = Vec::new();
+    let mut paths = Vec::new();
     let mut rejection = None;
-    for outline in dxf_outlines(&pairs) {
+    for outline in dxf_outlines(&pairs)? {
         match outline.contour() {
-            Ok(Some(points)) => loops.push(points),
+            Ok(Some(points)) => paths.push(points),
             Ok(None) => {}
             Err(error) => rejection = rejection.or(Some(error)),
         }
+    }
+    if paths.is_empty() {
+        return Err(rejection.unwrap_or_else(|| "DXF: нет поддерживаемых контуров. Блоки INSERT нужно разложить в CAD; поддержаны LINE, POLYLINE, LWPOLYLINE и SPLINE с контрольными точками.".into()));
     }
     let extent = |points: &[Point]| {
         let x = points.iter().map(|p| p.x);
         x.clone().fold(f64::NEG_INFINITY, f64::max) - x.fold(f64::INFINITY, f64::min)
     };
-    loops
-        .into_iter()
-        .max_by(|a, b| extent(a).total_cmp(&extent(b)))
-        .ok_or_else(|| {
-            rejection.unwrap_or_else(|| {
-                "DXF: не найден контур профиля. Экспортируйте его одной POLYLINE, \
-                 LWPOLYLINE или SPLINE минимум из 12 точек"
-                    .into()
-            })
+    let size = paths
+        .iter()
+        .map(|p| extent(p))
+        .fold(0.0, f64::max)
+        .max(1e-12);
+    let near = |a: Point, b: Point| (a.x - b.x).hypot(a.y - b.y) <= size * 1e-7;
+    // CAD often stores upper/lower surfaces as separate splines, or exports
+    // an unordered set of LINEs. Join only endpoints, never arbitrary points.
+    let mut loops = Vec::new();
+    while let Some(mut path) = paths.pop() {
+        loop {
+            if path.len() > 2 && near(path[0], *path.last().unwrap()) {
+                break;
+            }
+            let end = *path.last().unwrap();
+            let matches: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| {
+                    if near(end, p[0]) {
+                        Some((i, false))
+                    } else if near(end, *p.last().unwrap()) {
+                        Some((i, true))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if matches.len() != 1 {
+                break;
+            }
+            let (index, reverse) = matches[0];
+            let mut next = paths.swap_remove(index);
+            if reverse {
+                next.reverse();
+            }
+            path.extend(next.into_iter().skip(1));
+        }
+        // Require a plausible section rather than silently selecting a border.
+        if path.len() >= 12
+            && let Ok((a, b)) = split_loop(&path)
+        {
+            let width = extent(&path);
+            let height = path.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max)
+                - path.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+            if extent(&a) > 0.95 * width
+                && extent(&b) > 0.95 * width
+                && height > width * 1e-5
+                && height < width * 0.6
+            {
+                loops.push(path);
+            }
+        }
+    }
+    loops.sort_by(|a, b| extent(b).total_cmp(&extent(a)));
+    if loops.len() > 1 && extent(&loops[1]) > extent(&loops[0]) * 0.75 {
+        return Err("DXF: несколько сопоставимых профилей. Экспортируйте нужный профиль отдельно, чтобы не выбрать чужую геометрию.".into());
+    }
+    loops.into_iter().next().ok_or_else(|| rejection.unwrap_or_else(|| "DXF: не удалось собрать профиль. Нужен плоский контур в XY, носок слева, хорда вдоль X; разомкнутые или разветвлённые цепочки исправьте в CAD.".into()))
+}
+
+/// Homogeneous de Boor preserves rational CAD geometry instead of discarding weights.
+fn rational_de_boor(
+    degree: usize,
+    knots: &[f64],
+    control: &[Point],
+    weights: &[f64],
+    t: f64,
+) -> Point {
+    let span = (degree..control.len())
+        .rev()
+        .find(|&i| t >= knots[i])
+        .unwrap_or(degree);
+    let mut row: Vec<[f64; 3]> = (0..=degree)
+        .map(|j| {
+            let i = j + span - degree;
+            [
+                control[i].x * weights[i],
+                control[i].y * weights[i],
+                weights[i],
+            ]
         })
+        .collect();
+    for r in 1..=degree {
+        for j in (r..=degree).rev() {
+            let i = j + span - degree;
+            let width = knots[i + degree + 1 - r] - knots[i];
+            let a = if width.abs() < 1e-12 {
+                0.0
+            } else {
+                (t - knots[i]) / width
+            };
+            row[j] = std::array::from_fn(|k| (1.0 - a) * row[j - 1][k] + a * row[j][k]);
+        }
+    }
+    Point::new(
+        row[degree][0] / row[degree][2],
+        row[degree][1] / row[degree][2],
+    )
 }
 
 pub fn export_dat(analysis: &Analysis) -> String {
@@ -695,7 +816,41 @@ mod tests {
             ..Default::default()
         };
         // Fewer control points than the degree cannot define a curve.
-        assert!(outline.sampled_spline().unwrap().is_empty());
-        assert!(outline.contour().unwrap().is_none());
+        assert!(outline.sampled_spline().is_err());
+        assert!(outline.contour().is_err());
+    }
+}
+
+#[cfg(test)]
+mod rational_tests {
+    use super::*;
+    #[test]
+    fn rational_quarter_circle_retains_cad_weights() {
+        let control = [
+            Point::new(1.0, 0.0),
+            Point::new(1.0, 1.0),
+            Point::new(0.0, 1.0),
+        ];
+        for i in 0..=100 {
+            let p = rational_de_boor(
+                2,
+                &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                &control,
+                &[1.0, 0.5_f64.sqrt(), 1.0],
+                i as f64 / 100.0,
+            );
+            assert!((p.x * p.x + p.y * p.y - 1.0).abs() < 1e-12);
+        }
+    }
+    #[test]
+    fn malformed_knots_are_not_replaced_by_invented_geometry() {
+        let outline = Outline {
+            kind: "SPLINE".into(),
+            points: vec![Point::new(0.0, 0.0); 4],
+            degree: 3,
+            knots: vec![0.0; 3],
+            ..Default::default()
+        };
+        assert!(outline.sampled_spline().is_err());
     }
 }

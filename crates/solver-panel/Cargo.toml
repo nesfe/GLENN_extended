@@ -1,0 +1,13 @@
+[package]
+name = "glenn-solver-panel"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["nesfe"]
+
+[dependencies]
+glenn-core = { path = "../core" }
+glam = "0.30"
+
+[lints.rust]
+unsafe_code = "forbid"

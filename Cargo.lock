@@ -1265,18 +1265,77 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
 
 [[package]]
+name = "glenn-cli"
+version = "0.1.0"
+dependencies = [
+ "glenn-core",
+ "glenn-engine",
+ "glenn-io",
+ "glenn-solver-cfd",
+]
+
+[[package]]
+name = "glenn-core"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "glenn-engine"
+version = "0.1.0"
+
+[[package]]
 name = "glenn-extended"
-version = "3.2.0"
+version = "4.0.0-beta.1"
 dependencies = [
  "bytemuck",
  "cpal",
  "eframe",
  "glam",
+ "glenn-core",
+ "glenn-engine",
+ "glenn-io",
+ "glenn-solver-cfd",
+ "glenn-solver-panel",
  "image",
  "rfd",
  "serde",
  "serde_json",
  "wgpu",
+]
+
+[[package]]
+name = "glenn-io"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "glenn-core",
+ "glenn-solver-panel",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "glenn-solver-cfd"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "glenn-core",
+ "glenn-engine",
+ "glenn-io",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "glenn-solver-panel"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "glenn-core",
 ]
 
 [[package]]

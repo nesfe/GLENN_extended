@@ -131,24 +131,13 @@ impl Camera {
         )
     }
 }
-/// Display switches that change uploaded vertex colours but no numerical result.
-type Style = (bool, bool, bool, bool, usize);
-/// Traced-field inputs plus the requested line density.
-type FlowKey = ([f64; 13], usize);
-
-/// Numerical and GPU caches are independent of camera movement and animation.
-///
-/// Tracing is keyed on the inputs the field actually reads, never on the whole
-/// `Simulation`: a thrust, mass or fuel slider must not re-integrate hundreds
-/// of streamlines. The uploaded scene additionally depends on surface Mach and
-/// on the display switches.
+/// Numerical results arrive atomically from the engine; this module only draws.
 #[derive(Default)]
 pub struct Tunnel {
     pub renderer: Option<super::render::Renderer>,
-    pub grid: Option<glenn_extended::physics::flow::SectionGrid>,
-    paths: Vec<glenn_extended::physics::flow::Streamline>,
-    flow: Option<FlowKey>,
-    scene: Option<(FlowKey, f64, Style)>,
+    pub grid: Option<std::sync::Arc<glenn_extended::physics::flow::SectionGrid>>,
+    pub pending_scene: Option<super::render::Scene>,
+    pub busy: bool,
     clock: f64,
     last_time: Option<f64>,
 }
@@ -182,6 +171,15 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
         .small()
         .color(MUTED),
     );
+    if tunnel.busy {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Пересчёт… Показан последний завершённый результат.");
+        });
+    }
+    if analysis.current.stall_fraction > 0.12 {
+        ui.colored_label(AMBER, "Панельный режим: отрыв не решается. Для вязкого отрыва используйте вкладку «Объёмная CFD».");
+    }
     let height = (ui.available_height() - 110.0).clamp(280.0, 620.0);
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::drag());
@@ -247,46 +245,8 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
         .min(rect.height() as f64 * 0.50 / extent(1).max(state.chord * 0.85))
         * view.zoom;
     if let Some(renderer) = &mut tunnel.renderer {
-        // A new airfoil invalidates both the sampled bases and everything traced
-        // or uploaded from them, so neither cache may survive on an equal key.
-        if tunnel
-            .grid
-            .as_ref()
-            .is_none_or(|grid| grid.foil != analysis.foil)
-        {
-            tunnel.grid = Some(glenn_extended::physics::flow::SectionGrid::new(
-                &analysis.foil,
-                &analysis.panel,
-            ));
-            tunnel.flow = None;
-            tunnel.scene = None;
-        }
-        let flow = (
-            glenn_extended::physics::flow::field_fingerprint(analysis),
-            view.density,
-        );
-        if tunnel.flow != Some(flow) {
-            let field = glenn_extended::physics::flow::FlowField {
-                analysis,
-                grid: tunnel.grid.as_ref().unwrap(),
-            };
-            tunnel.paths = field.streamlines(view.density);
-            tunnel.flow = Some(flow);
-        }
-        let scene = (
-            flow,
-            aero.mach,
-            (
-                view.streamlines,
-                view.vortices,
-                view.pressure,
-                view.wireframe,
-                view.palette,
-            ),
-        );
-        if tunnel.scene != Some(scene) {
-            renderer.upload(&super::render::Scene::new(analysis, &tunnel.paths, view));
-            tunnel.scene = Some(scene);
+        if let Some(scene) = tunnel.pending_scene.take() {
+            renderer.upload(&scene);
         }
         let pixels = ui.ctx().pixels_per_point();
         let texture = renderer.render(
@@ -448,7 +408,7 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut view.animate, "Анимация");
         ui.checkbox(&mut view.streamlines, "Линии тока");
-        ui.checkbox(&mut view.vortices, "Вихри");
+        ui.checkbox(&mut view.vortices, "Модель концевого следа");
         ui.checkbox(&mut view.forces, "Силы");
         ui.checkbox(&mut view.pressure, "Давление");
         ui.checkbox(&mut view.wireframe, "Сетка");

@@ -1,0 +1,12 @@
+[package]
+name = "glenn-engine"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["nesfe"]
+
+[dependencies]
+
+
+[lints.rust]
+unsafe_code = "forbid"

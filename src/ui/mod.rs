@@ -1,10 +1,12 @@
 //! Desktop composition. Panels own their space; no floating tool windows can
 //! become unreachable. Narrow windows put controls on a dedicated page.
 mod controls;
+mod jobs;
 mod pages;
 mod plots;
 mod render;
 mod tunnel;
+mod volume;
 use crate::audio::TunnelAudio;
 use eframe::egui::{self, Color32, RichText, Vec2};
 use glenn_extended::{
@@ -30,6 +32,8 @@ pub struct Capture {
     pub scroll_end: bool,
     pub alpha: Option<f64>,
     pub camera: usize,
+    pub input: Option<PathBuf>,
+    pub cfd_case: Option<PathBuf>,
 }
 impl Capture {
     pub fn from_args(args: &[String]) -> Option<Self> {
@@ -44,6 +48,8 @@ impl Capture {
             .and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))
             .unwrap_or([1440.0, 900.0]);
         Some(Self {
+            input: value("--input").map(PathBuf::from),
+            cfd_case: value("--cfd-case").map(PathBuf::from),
             scroll_end: args.iter().any(|arg| arg == "--scroll-end"),
             alpha: value("--alpha").and_then(|s| s.parse().ok()),
             camera: value("--camera").and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -62,8 +68,14 @@ pub struct Workbench {
     state: Simulation,
     analysis: Analysis,
     performance: Performance,
+    worker: glenn_extended::engine::Worker<jobs::Request, jobs::Snapshot>,
+    requested: Option<jobs::Request>,
+    import_message: Option<Result<String, String>>,
+    importer: glenn_extended::engine::Worker<(PathBuf, Simulation), jobs::Imported>,
+    importing: bool,
     view: tunnel::View,
     tunnel: tunnel::Tunnel,
+    volume_flow: volume::Volume,
     page: usize,
     control_tab: usize,
     preset: usize,
@@ -134,7 +146,7 @@ impl Workbench {
         }
         let mut app = Self::with_state(starting_state);
         if let Some(capture) = &capture {
-            app.page = capture.page.min(6);
+            app.page = capture.page.min(7);
             app.control_tab = capture.control_tab.min(3);
             app.preset = capture.preset.min(app.presets.len() - 1);
             app.view.animate = false;
@@ -151,6 +163,17 @@ impl Workbench {
             .wgpu_render_state
             .clone()
             .map(render::Renderer::new);
+        app.volume_flow.renderer = creation
+            .wgpu_render_state
+            .clone()
+            .map(render::Renderer::new);
+        if let Some(path) = capture.as_ref().and_then(|c| c.input.clone()) {
+            app.load(path);
+        }
+        if let Some(path) = capture.as_ref().and_then(|c| c.cfd_case.clone()) {
+            app.volume_flow.open_case(path);
+            app.page = 7;
+        }
         app.capture = capture;
         app
     }
@@ -158,7 +181,7 @@ impl Workbench {
         let (analysis, status) = match Analysis::new(state) {
             Ok(analysis) => (
                 analysis,
-                "Готово. Перетащите DAT, DXF или JSON в окно.".into(),
+                "Готово. Перетащите DAT, DXF, STL или JSON в окно.".into(),
             ),
             Err(error) => (
                 Analysis::new(Simulation::default()).expect("tested default simulation"),
@@ -169,12 +192,19 @@ impl Workbench {
         };
         let state = analysis.state.clone();
         let performance = flight::calculate(&analysis);
+        let worker = jobs::worker(analysis.clone());
         Self {
+            worker,
+            requested: None,
+            import_message: None,
+            importer: jobs::importer(),
+            importing: false,
             state,
             analysis,
             performance,
             view: tunnel::View::default(),
             tunnel: tunnel::Tunnel::default(),
+            volume_flow: volume::Volume::default(),
             page: 0,
             control_tab: 0,
             preset: 0,
@@ -188,35 +218,52 @@ impl Workbench {
         }
     }
     fn load(&mut self, path: PathBuf) {
-        let result: Result<String, String> = (|| {
-            let text = interchange::read_text(&path)?;
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("profile.dat");
-            if name.to_lowercase().ends_with(".json") {
-                let (state, notice) = interchange::load_project(&text)?;
-                self.state = state;
-                Ok(notice.unwrap_or_else(|| "Проект загружен".into()))
-            } else {
-                self.state = interchange::import_airfoil(&text, name, &self.state)?;
-                Ok("Профиль загружен".into())
-            }
-        })();
-        self.status = match result {
-            Ok(message) => message,
-            Err(error) => format!("Ошибка импорта: {error}"),
-        };
+        self.status = format!("Чтение {}…", path.display());
+        self.import_message = None;
+        self.importing = true;
+        self.importer.submit((path, self.state.clone()));
+    }
+    fn poll_import(&mut self) {
+        if let Some((_, result)) = self.importer.poll() {
+            self.importing = false;
+            let message = result.map(|imported| match imported {
+                jobs::Imported::Profile(state, message) => {
+                    self.state = state;
+                    self.page = 1;
+                    message
+                }
+                jobs::Imported::Project(state, message) => {
+                    self.state = state;
+                    message
+                }
+                jobs::Imported::Solid(mesh, name) => {
+                    self.volume_flow.set_mesh(mesh, name.clone());
+                    self.page = 7;
+                    format!("STL «{name}» загружен. Выберите единицы координат и запустите CFD.")
+                }
+            });
+            self.status = match &message {
+                Ok(s) => s.clone(),
+                Err(e) => format!("Ошибка импорта: {e}"),
+            };
+            self.import_message = Some(message);
+        }
     }
     fn import_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Профиль или проект", &["dat", "dxf", "json"])
+            .add_filter("Профиль или проект", &["dat", "dxf", "stl", "json"])
             .pick_file()
         {
             self.load(path);
         }
     }
     fn export(&mut self, extension: &str) {
+        if extension != "json" && (self.tunnel.busy || self.analysis.state != self.state) {
+            self.import_message = Some(Err(
+                "Экспорт результата доступен после завершения текущего расчёта.".into(),
+            ));
+            return;
+        }
         let data = match extension {
             "json" => interchange::save_project(&self.state),
             "dat" => Ok(interchange::export_dat(&self.analysis)),
@@ -242,14 +289,34 @@ impl Workbench {
         }
     }
     fn recalculate(&mut self) {
-        if self.analysis.state == self.state {
-            return;
+        let request = jobs::Request {
+            state: self.state.clone(),
+            view: self.view.clone(),
+            scene: self.tunnel.renderer.is_some(),
+        };
+        if self
+            .requested
+            .as_ref()
+            .is_none_or(|old| !old.same(&request))
+        {
+            self.worker.submit(request.clone());
+            self.requested = Some(request);
+            self.tunnel.busy = true;
         }
-        match self.analysis.update(&self.state) {
-            Ok(()) => self.performance = flight::calculate(&self.analysis),
-            Err(error) => {
-                self.status = format!("Расчёт остановлен: {error}");
-                self.state = self.analysis.state.clone();
+        if let Some((_, result)) = self.worker.poll() {
+            self.tunnel.busy = false;
+            match result {
+                Ok(snapshot) => {
+                    self.analysis = snapshot.analysis;
+                    self.performance = snapshot.performance;
+                    self.tunnel.grid = snapshot.grid;
+                    self.tunnel.pending_scene = snapshot.scene;
+                }
+                Err(error) => {
+                    self.status = format!("Расчёт остановлен: {error}");
+                    self.import_message = Some(Err(self.status.clone()));
+                    self.state = self.analysis.state.clone();
+                }
             }
         }
     }
@@ -276,7 +343,10 @@ impl Workbench {
                     if ui.button("Открыть…").clicked() {
                         self.import_dialog();
                     }
-                    if ui.button("Сохранить проект").clicked() {
+                    if ui
+                        .add_enabled(self.page != 7, egui::Button::new("Сохранить проект"))
+                        .clicked()
+                    {
                         self.export("json");
                     }
                 });
@@ -325,11 +395,12 @@ impl Workbench {
                         "Файлы",
                         "О модели",
                         "Параметры",
+                        "Объёмная CFD",
                     ]
                     .iter()
                     .enumerate()
                     {
-                        if i < 6 || compact {
+                        if i != 6 || compact {
                             ui.selectable_value(&mut self.page, i, *label);
                         }
                     }
@@ -337,10 +408,13 @@ impl Workbench {
             });
         self.regions.push(("header", header.response.rect));
         let footer = egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            if self.importing {
+                ui.spinner();
+            }
             ui.label(RichText::new(&self.status).small().color(MUTED));
         });
         self.regions.push(("footer", footer.response.rect));
-        if !compact {
+        if !compact && self.page != 7 {
             let sidebar = egui::SidePanel::left("parameters")
                 .resizable(false)
                 .exact_width(294.0)
@@ -398,10 +472,42 @@ impl eframe::App for Workbench {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.import_dialog();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+            && self.page != 7
+        {
             self.export("json");
         }
+        self.poll_import();
+        self.volume_flow.poll(ctx);
         self.draw(ctx);
+        if self.tunnel.busy || self.importing {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if let Some(message) = &self.import_message {
+            let mut dismiss = false;
+            egui::Window::new(if message.is_ok() {
+                "Импорт завершён"
+            } else {
+                "Ошибка импорта / расчёта"
+            })
+            .collapsible(false)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                match message {
+                    Ok(text) => {
+                        ui.label(text);
+                    }
+                    Err(text) => {
+                        ui.colored_label(AMBER, text);
+                    }
+                }
+                dismiss = ui.button("Понятно").clicked();
+            });
+            if dismiss {
+                self.import_message = None;
+            }
+        }
         if let Some(audio) = &self.audio {
             audio.update(
                 self.state.velocity,
@@ -414,7 +520,11 @@ impl eframe::App for Workbench {
         }
         if let Some(capture) = &self.capture {
             ctx.request_repaint_after(Duration::from_millis(20));
-            if self.frames == 8 {
+            if self.frames >= 8
+                && !self.tunnel.busy
+                && !self.importing
+                && !self.volume_flow.pending()
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             let screenshot = ctx.input(|i| {
@@ -464,6 +574,53 @@ impl eframe::App for Workbench {
 mod tests {
     use super::*;
     #[test]
+    fn desktop_import_reports_success_and_failure_without_losing_the_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "glenn-ui-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = Workbench::with_state(Simulation::default());
+        let foil = glenn_extended::geometry::Airfoil::generate(&app.state);
+        let mut dxf = "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n70\n1\n".to_string();
+        for p in foil.contour() {
+            dxf.push_str(&format!("10\n{}\n20\n{}\n", p.x, p.y));
+        }
+        dxf.push_str("0\nENDSEC\n0\nEOF\n");
+        let valid = dir.join("профиль с пробелами.DXF");
+        std::fs::write(&valid, dxf).unwrap();
+        let wait = |app: &mut Workbench| {
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while app.importing {
+                app.poll_import();
+                assert!(std::time::Instant::now() < until, "Импорт завис");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        app.load(valid);
+        wait(&mut app);
+        assert_eq!(app.page, 1);
+        assert!(app.state.custom_upper.is_some());
+        assert!(app.import_message.as_ref().unwrap().is_ok());
+        let saved = app.state.clone();
+        let broken = dir.join("сломанный.dxf");
+        std::fs::write(&broken, "not a DXF file").unwrap();
+        app.load(broken);
+        wait(&mut app);
+        assert!(app.import_message.as_ref().unwrap().is_err());
+        assert!(app.status.contains("Ошибка импорта"));
+        assert_eq!(app.state, saved);
+        app.load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cube.stl"));
+        wait(&mut app);
+        assert_eq!(app.page, 7);
+        assert!(app.import_message.as_ref().unwrap().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn panels_fit_without_intersection_at_supported_sizes() {
         for (width, height) in [
             (640.0, 480.0),
@@ -476,8 +633,14 @@ mod tests {
             let ctx = egui::Context::default();
             style(&ctx);
             let mut app = Workbench::with_state(Simulation::default());
-            for scenario in 0..11 {
-                let page = if scenario == 10 { 0 } else { scenario.min(6) };
+            for scenario in 0..12 {
+                let page = if scenario == 11 {
+                    7
+                } else if scenario == 10 {
+                    0
+                } else {
+                    scenario.min(6)
+                };
                 app.view.probe = scenario == 10;
                 app.page = page;
                 app.control_tab = scenario.saturating_sub(6).min(3);

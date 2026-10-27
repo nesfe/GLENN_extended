@@ -300,3 +300,33 @@ fn profile_thickness_and_flap_change_the_computed_flow() {
         );
     }
 }
+#[test]
+fn cancellation_never_returns_a_partial_basis_or_trace_as_a_solution() {
+    use glenn_extended::{
+        model::Simulation,
+        physics::{
+            aerodynamics::Analysis,
+            flow::{FlowField, SectionGrid},
+        },
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let analysis = Analysis::new(Simulation::default()).unwrap();
+    let calls = AtomicUsize::new(0);
+    assert!(
+        SectionGrid::new_cancellable(&analysis.foil, &analysis.panel, &|| calls
+            .fetch_add(1, Ordering::Relaxed)
+            > 2)
+        .is_none()
+    );
+    let grid = SectionGrid::new(&analysis.foil, &analysis.panel);
+    let calls = AtomicUsize::new(0);
+    let field = FlowField {
+        analysis: &analysis,
+        grid: &grid,
+    };
+    assert!(
+        field
+            .streamlines_cancellable(3, &|| calls.fetch_add(1, Ordering::Relaxed) > 20)
+            .is_none()
+    );
+}
