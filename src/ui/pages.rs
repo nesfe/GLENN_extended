@@ -7,6 +7,31 @@ impl Workbench {
             controls::show(ui, &mut self.state, &mut self.control_tab);
             return;
         }
+        if self.page == 7 {
+            if ui.button("Передать текущее крыло в CFD").clicked() {
+                let faces = self
+                    .analysis
+                    .mesh
+                    .triangles
+                    .iter()
+                    .map(|t| t.map(|i| glam::DVec3::from_array(self.analysis.mesh.vertices[i])))
+                    .collect();
+                match glenn_extended::mesh::SolidMesh::from_triangles(faces) {
+                    Ok(mesh) => self
+                        .volume_flow
+                        .set_mesh(mesh, self.analysis.state.profile_name.clone()),
+                    Err(e) => self.import_message = Some(Err(e)),
+                }
+            }
+            self.volume_flow.show(ui);
+            return;
+        }
+        if self.tunnel.busy {
+            ui.colored_label(
+                AMBER,
+                "Пересчёт: показаны данные последнего завершённого запроса.",
+            );
+        }
         self.telemetry(ui);
         ui.add_space(12.0);
         if self.analysis.current.mach > 0.75 {
@@ -57,11 +82,11 @@ impl Workbench {
             ui.add(
                 egui::Label::new(
                     RichText::new(if r.stall_fraction > 0.4 {
-                        "Срыв потока"
+                        "Эмпирическая оценка срыва"
                     } else if r.stall_fraction > 0.12 {
                         "Предсрывной режим"
                     } else {
-                        "Безотрывный режим"
+                        "Панельный режим"
                     })
                     .color(if r.stall_fraction > 0.12 { AMBER } else { CYAN }),
                 )
@@ -261,7 +286,7 @@ impl Workbench {
         ui.label(
             "Параметры автоматически сохраняются между запусками. Для переноса используйте JSON.",
         );
-        if ui.button("Открыть DAT / DXF / JSON…").clicked() {
+        if ui.button("Открыть DAT / DXF / STL / JSON…").clicked() {
             self.import_dialog();
         }
         ui.add_space(16.0);
@@ -302,10 +327,10 @@ impl Workbench {
                 });
         }
         ui.add_space(12.0);
-        ui.label("DAT: Selig и Lednicer с числом точек. DXF: одна POLYLINE или LWPOLYLINE из отрезков; сплайны и дуги предварительно дискретизируйте в CAD. Максимальный размер — 2 МБ.");
+        ui.label("DAT: Selig и Lednicer. DXF: полилинии, сплайны и соединённые отрезки. После импорта показывается подтверждение или причина отказа.");
     }
     pub(super) fn about_ui(&self, ui: &mut egui::Ui) {
-        ui.heading("GLENN Extended 3.0");
+        ui.heading(concat!("GLENN Extended ", env!("CARGO_PKG_VERSION")));
         ui.label("Нативная лаборатория аэродинамики на Rust. Автор проекта: nesfe. Лицензия MIT.");
         ui.hyperlink_to(
             "Исходный код и релизы",
@@ -318,12 +343,16 @@ impl Workbench {
                 "Панели Гесса–Смита: постоянные источники, общая циркуляция и условие Кутты. Две базисные задачи на геометрию, затем линейная комбинация для каждого угла атаки.",
             ),
             (
-                "Область применимости",
-                "Потенциальное 2D-обтекание, инженерная поправка конечного крыла и эмпирический срыв. Это учебная модель; полноценные вязкие уравнения Навье–Стокса и трёхмерная несущая линия не решаются.",
+                "Панельный режим",
+                "Потенциальное 2D-обтекание, инженерная поправка конечного крыла и эмпирический срыв. Отрыв вязкого потока и свободная вихревая пелена этим методом не решаются.",
             ),
             (
-                "Ограничения",
+                "Ограничения панельного режима",
                 "Cp после срыва и при M > 0,75 не валидирован. Планетарные атмосферы приближённые. Предкрылки и закрылки моделируются деформацией без разрешения щелей. Линии тока и зонд используют единое поле: панельный расчёт сечений и приближённый концевой след. Это не решение трёхмерных уравнений Навье–Стокса. После срыва показан только средний дефицит скорости; турбулентность не рассчитывается.",
+            ),
+            (
+                "Объёмная CFD",
+                "Отдельный модуль OpenFOAM для вязкого несжимаемого обтекания STL: laminar, RANS SST и URANS SST. Поле, завихрённость и силы читаются из одного расчёта. Решатель устанавливается отдельно. Проверяйте сходимость, сетку, y+ и соответствие модели задаче; сверхзвуковой CFD не реализован.",
             ),
             (
                 "Что изменилось в v3",

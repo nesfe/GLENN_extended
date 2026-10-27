@@ -207,6 +207,6 @@ pub struct Preset {
     pub state: Simulation,
 }
 pub fn presets() -> Vec<Preset> {
-    serde_json::from_str(include_str!("../assets/presets.json"))
+    serde_json::from_str(include_str!("../../../assets/presets.json"))
         .expect("bundled presets are validated in tests")
 }

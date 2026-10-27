@@ -1,0 +1,16 @@
+[package]
+name = "glenn-io"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["nesfe"]
+
+[dependencies]
+glenn-core = { path = "../core" }
+glenn-solver-panel = { path = "../solver-panel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glam = "0.30"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,6 +1,10 @@
+[workspace]
+members = [".", "crates/*"]
+resolver = "2"
+
 [package]
 name = "glenn-extended"
-version = "3.2.0"
+version = "4.0.0-beta.1"
 edition = "2024"
 rust-version = "1.88"
 authors = ["nesfe"]
@@ -9,6 +13,11 @@ description = "Native aerodynamic workbench with a cached Hess–Smith panel sol
 repository = "https://github.com/nesfe/GLENN_extended"
 
 [dependencies]
+glenn-core = { path = "crates/core" }
+glenn-solver-panel = { path = "crates/solver-panel" }
+glenn-io = { path = "crates/io" }
+glenn-engine = { path = "crates/engine" }
+glenn-solver-cfd = { path = "crates/solver-cfd" }
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland", "persistence"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

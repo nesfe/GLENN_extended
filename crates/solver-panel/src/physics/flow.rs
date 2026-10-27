@@ -52,16 +52,28 @@ fn parallel_chunks<T: Send>(
 
 /// Two velocity bases are sampled once per airfoil. Changing incidence combines
 /// these bases instead of solving or sampling thousands of panels again.
+#[derive(Clone)]
 pub struct SectionGrid {
     pub foil: Airfoil,
     bases: Vec<[Point; 2]>,
 }
 impl SectionGrid {
     pub fn new(foil: &Airfoil, panel: &PanelModel) -> Self {
+        Self::new_cancellable(foil, panel, &|| false).unwrap()
+    }
+
+    pub fn new_cancellable(
+        foil: &Airfoil,
+        panel: &PanelModel,
+        cancelled: &(impl Fn() -> bool + Sync),
+    ) -> Option<Self> {
         // Row-major, matching the bilinear lookup below.
         let bases = parallel_chunks(GRID_Y, |rows| {
             let mut out = Vec::with_capacity(rows.len() * GRID_X);
             for row in rows {
+                if cancelled() {
+                    break;
+                }
                 for column in 0..GRID_X {
                     let point = Point::new(
                         X_MIN + (X_MAX - X_MIN) * column as f64 / (GRID_X - 1) as f64,
@@ -72,10 +84,10 @@ impl SectionGrid {
             }
             out
         });
-        Self {
+        (bases.len() == GRID_X * GRID_Y && !cancelled()).then(|| Self {
             foil: foil.clone(),
             bases,
-        }
+        })
     }
 
     pub fn velocity(&self, panel: &PanelModel, point: Point, incidence: f64) -> Point {
@@ -240,6 +252,15 @@ impl FlowField<'_> {
     }
 
     pub fn trace(&self, seed: DVec3, vortex: bool) -> Streamline {
+        self.trace_cancellable(seed, vortex, &|| false)
+    }
+
+    fn trace_cancellable(
+        &self,
+        seed: DVec3,
+        vortex: bool,
+        cancelled: &impl Fn() -> bool,
+    ) -> Streamline {
         let state = &self.analysis.state;
         let chord = state.chord;
         let mut position = seed;
@@ -252,6 +273,9 @@ impl FlowField<'_> {
             + 4.2 * chord;
         let steps = (((max_x - seed.x).abs() / chord / 0.035) as usize + 200).min(1600);
         for _ in 0..steps {
+            if cancelled() {
+                break;
+            }
             if self.contains_solid(position)
                 || position.x > max_x
                 || position.y.abs() > 4.0 * chord + state.span * 0.3
@@ -305,20 +329,30 @@ impl FlowField<'_> {
     }
 
     pub fn streamlines(&self, density: usize) -> Vec<Streamline> {
+        self.streamlines_cancellable(density, &|| false).unwrap()
+    }
+
+    pub fn streamlines_cancellable(
+        &self,
+        density: usize,
+        cancelled: &(impl Fn() -> bool + Sync),
+    ) -> Option<Vec<Streamline>> {
         let seeds = self.seeds(density);
         // Each trace reads the shared field and writes nothing, so integrating
         // them on several cores gives the same lines in the same order.
-        parallel_chunks(seeds.len(), |range| {
+        let paths = parallel_chunks(seeds.len(), |range| {
             seeds[range]
                 .iter()
-                .map(|&(seed, vortex)| self.trace(seed, vortex))
+                .take_while(|_| !cancelled())
+                .map(|&(seed, vortex)| self.trace_cancellable(seed, vortex, cancelled))
                 .collect()
         })
         .into_iter()
         // A line that stops within a few steps of its seed carries no
         // information; tip strands are kept so the vortex core stays visible.
         .filter(|line| line.vortex || line.samples.len() > 12)
-        .collect()
+        .collect();
+        (!cancelled()).then_some(paths)
     }
 
     /// Injection points for the tracer rake and the tip strands, in the order

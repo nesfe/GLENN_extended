@@ -334,7 +334,8 @@ fn dxf_import_handles_the_shapes_real_cad_exports() {
             .map(|p| format!("0\nVERTEX\n8\n0\n10\n{}\n20\n{}\n30\n0.0\n", p.x, p.y))
             .collect::<String>()
     );
-    // A SPLINE through the contour as fit points: what most CAD writes.
+    // Fit-only splines do not define enough geometry; explicitly reject rather
+    // than silently substituting straight segments for the CAD curve.
     let spline = format!(
         "0\nSPLINE\n8\n0\n70\n8\n71\n3\n74\n{}\n{}",
         contour.len(),
@@ -343,11 +344,20 @@ fn dxf_import_handles_the_shapes_real_cad_exports() {
             .map(|p| format!("11\n{}\n21\n{}\n31\n0.0\n", p.x, p.y))
             .collect::<String>()
     );
-    // Clamped uniform degree-3 spline given by control points only.
+    assert!(
+        interchange::import_airfoil(&section(spline), "fit.dxf", &state)
+            .unwrap_err()
+            .contains("контрольных")
+    );
+    // A full DXF knot vector is required; do not invent CAD geometry.
+    let knots = (0..contour.len() + 4)
+        .map(|i| format!("40\n{}\n", i.saturating_sub(3).min(contour.len() - 3)))
+        .collect::<String>();
+    // Clamped uniform degree-3 spline.
     let control = format!(
         "0\nSPLINE\n8\n0\n70\n8\n71\n3\n73\n{}\n{}",
         contour.len(),
-        vertices(&contour)
+        vertices(&contour) + &knots
     );
     let noise = "0\nLINE\n8\nconstruction\n10\n0.0\n20\n0.0\n11\n1.0\n21\n0.0\n\
                  0\nTEXT\n8\nnotes\n10\n0.2\n20\n0.3\n40\n0.05\n1\nNACA 2412\n\
@@ -362,7 +372,6 @@ fn dxf_import_handles_the_shapes_real_cad_exports() {
         ("rotated start point", section(lwpolyline(&rotated)), 1e-9),
         ("millimetres, offset", section(lwpolyline(&scaled)), 1e-9),
         ("r12 polyline/vertex", section(old_style), 1e-9),
-        ("spline fit points", section(spline), 1e-9),
         ("spline control points", section(control), 0.004),
         (
             "drawing with construction geometry",

@@ -40,6 +40,7 @@ impl AeroResult {
 /// A single cache shared by the UI, charts, performance model and file exports.
 /// Presentation settings never enter this type, so changing atmosphere camera or color
 /// does not cause numerical work. Geometry changes alone refactor the panel system.
+#[derive(Clone)]
 pub struct Analysis {
     pub state: Simulation,
     pub foil: Airfoil,
