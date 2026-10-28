@@ -114,10 +114,7 @@ impl Default for Volume {
             mesh: None,
             name: String::new(),
             cfg: Config::default(),
-            backend: Backend {
-                wsl: cfg!(target_os = "windows"),
-                ..Backend::default()
-            },
+            backend: Backend::default(),
             scale: 1.0,
             folder: std::env::current_dir()
                 .unwrap_or_default()
@@ -311,10 +308,10 @@ impl Volume {
                     / self.cfg.kinematic_viscosity
             ));
         });
-        ui.collapsing("Подключение решателя и каталог расчётов",|ui| {
+        ui.collapsing("Каталог расчётов и дополнительные настройки",|ui| {
             ui.checkbox(&mut self.backend.wsl,"Запуск через WSL (Windows)");
-            ui.label("Путь к OpenFOAM etc/bashrc; пусто, если решатель уже в PATH:");ui.text_edit_singleline(&mut self.backend.bashrc);
-            ui.small("Пример для WSL: /usr/lib/openfoam/openfoam2412/etc/bashrc. OpenFOAM устанавливается отдельно.");
+            ui.label("Внешний OpenFOAM etc/bashrc (для разработчиков); пусто — комплектный решатель:");ui.text_edit_singleline(&mut self.backend.bashrc);
+            ui.small("Обычный запуск использует решатель из полного архива GLENN. Эти настройки нужны только для замены расчётного модуля.");
             ui.label("Каталог результатов (каждый запуск — отдельная папка):");ui.text_edit_singleline(&mut self.folder);
         });
         ui.horizontal(|ui| {

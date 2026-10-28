@@ -177,7 +177,9 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
             ui.label("Пересчёт… Показан последний завершённый результат.");
         });
     }
-    if analysis.current.stall_fraction > 0.12 {
+    if analysis.current.mach > 0.75 {
+        ui.colored_label(AMBER, "За пределами применимости: эти линии не показывают ударные волны и вязкий отрыв. Объёмный несжимаемый CFD также не подходит для этого числа Маха.");
+    } else if analysis.current.stall_fraction > 0.12 {
         ui.colored_label(AMBER, "Панельный режим: отрыв не решается. Для вязкого отрыва используйте вкладку «Объёмная CFD».");
     }
     let height = (ui.available_height() - 110.0).clamp(280.0, 620.0);

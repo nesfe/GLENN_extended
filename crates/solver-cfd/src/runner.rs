@@ -12,7 +12,7 @@ use std::{
 };
 #[derive(Clone, Debug, Default)]
 pub struct Backend {
-    /// Optional OpenFOAM etc/bashrc. Empty means commands are already on PATH.
+    /// Expert override. Empty selects the runtime bundled beside the executable.
     pub bashrc: String,
     /// Windows uses an installed WSL distribution; all paths passed as argv.
     pub wsl: bool,
@@ -76,7 +76,7 @@ wait "$pid"
             c.args(["--noprofile", "--norc", "-c", script, "glenn"]);
             c
         } else {
-            let mut c = Command::new(tool);
+            let mut c = crate::runtime::Runtime::discover()?.command(tool)?;
             c.arg("-case").arg(&case_path);
             c.args(args);
             return Ok(c);
@@ -88,6 +88,36 @@ wait "$pid"
             .arg(case_path)
             .args(args);
         Ok(cmd)
+    }
+}
+// WSL emits UTF-16 on Windows, whereas solver logs are UTF-8. Never silently
+// discard the diagnostic because read_to_string rejected its encoding.
+fn decode_log(bytes: &[u8]) -> String {
+    let utf16 = bytes.starts_with(&[0xff, 0xfe])
+        || (bytes.len() >= 8
+            && bytes.chunks_exact(2).take(64).filter(|c| c[1] == 0).count()
+                > bytes.len().min(128) / 8);
+    if utf16 {
+        let bytes = bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes);
+        String::from_utf16_lossy(
+            &bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+#[cfg(test)]
+mod log_tests {
+    use super::decode_log;
+    #[test]
+    fn windows_and_native_diagnostics_remain_readable() {
+        let message = "WSL: нет установленных дистрибутивов. wsl.exe --install";
+        let encoded: Vec<_> = message.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_log(&encoded), message);
+        assert_eq!(decode_log(message.as_bytes()), message);
     }
 }
 fn stage(
@@ -108,7 +138,7 @@ fn stage(
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
     let mut child=backend.command(tool,case,args)?.stdout(Stdio::from(log)).stderr(Stdio::from(err)).spawn()
-        .map_err(|e|format!("Не удалось запустить {tool}: {e}. Установите OpenFOAM и укажите etc/bashrc (Windows — через WSL)."))?;
+        .map_err(|e|format!("Не удалось запустить {tool}: {e}. Проверьте целостность полного архива GLENN и журнал запуска."))?;
     let mut reported = Instant::now();
     loop {
         if token.is_cancelled() {
@@ -123,7 +153,7 @@ fn stage(
             if status.success() {
                 break;
             }
-            let log = fs::read_to_string(&log_path).unwrap_or_default();
+            let log = decode_log(&fs::read(&log_path).unwrap_or_default());
             let tail = log
                 .lines()
                 .rev()
@@ -169,6 +199,9 @@ pub fn run(
     progress: &Arc<Mutex<String>>,
 ) -> Result<RunResult, String> {
     token.check()?;
+    if backend.bashrc.is_empty() && !backend.wsl {
+        crate::runtime::Runtime::discover()?;
+    }
     write_case(case, mesh, cfg)?;
     let case = case.canonicalize().map_err(|e| e.to_string())?;
     stage(backend, &case, "blockMesh", &[], token, progress)?;
