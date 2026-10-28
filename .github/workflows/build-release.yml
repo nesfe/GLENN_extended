@@ -85,6 +85,13 @@ jobs:
           for alpha in -10 0 10 22; do
             timeout 60s xvfb-run -a -s '-screen 0 1920x1080x24' target/release/glenn-extended --screenshot "artifacts/screenshots/flow-$alpha.png" --size 1440x900 --alpha "$alpha" --camera 1
           done
+      - name: Bundle native Windows CFD
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python scripts/bundle_windows.py artifacts/package/runtime/openfoam
+          Copy-Item target/release/glenn-extended.exe,target/release/glenn-cfd.exe artifacts/package/
+          python scripts/test_bundled_cfd.py artifacts/package/glenn-cfd.exe tests/fixtures/cube.stl
       - name: Package Windows portable executable
         if: runner.os == 'Windows'
         shell: pwsh
@@ -95,7 +102,6 @@ jobs:
           Copy-Item -Recurse docs artifacts/package/
           Copy-Item assets/fonts/LICENSE-DejaVu.txt artifacts/package/
           Compress-Archive -Path artifacts/package/* -DestinationPath "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip"
-          Copy-Item target/release/glenn-extended.exe "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.exe"
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
