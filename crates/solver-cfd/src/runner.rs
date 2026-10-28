@@ -43,7 +43,13 @@ fn posix_path(path: &Path, wsl: bool) -> Result<String, String> {
     Ok(text.into())
 }
 impl Backend {
-    fn command(&self, tool: &str, case: &Path, args: &[&str]) -> Result<Command, String> {
+    fn command(
+        &self,
+        tool: &str,
+        case: &Path,
+        args: &[&str],
+        runtime: Option<&crate::runtime::Runtime>,
+    ) -> Result<Command, String> {
         let case_path = posix_path(case, self.wsl)?;
         // No interpolated shell text. The script is constant; every path and
         // argument is passed positionally, including spaces and shell characters.
@@ -76,7 +82,9 @@ wait "$pid"
             c.args(["--noprofile", "--norc", "-c", script, "glenn"]);
             c
         } else {
-            let mut c = crate::runtime::Runtime::discover()?.command(tool)?;
+            let mut c = runtime
+                .ok_or("Комплектный решатель не подготовлен")?
+                .command(tool)?;
             c.arg("-case").arg(&case_path);
             c.args(args);
             return Ok(c);
@@ -137,7 +145,12 @@ fn stage(
     let log_path = case.join(format!("log.{log_name}"));
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut child=backend.command(tool,case,args)?.stdout(Stdio::from(log)).stderr(Stdio::from(err)).spawn()
+    let runtime = if backend.bashrc.is_empty() && !backend.wsl {
+        Some(crate::runtime::Runtime::discover()?)
+    } else {
+        None
+    };
+    let mut child=backend.command(tool,case,args,runtime.as_ref())?.stdout(Stdio::from(log)).stderr(Stdio::from(err)).spawn()
         .map_err(|e|format!("Не удалось запустить {tool}: {e}. Проверьте целостность полного архива GLENN и журнал запуска."))?;
     let mut reported = Instant::now();
     loop {
@@ -203,17 +216,23 @@ pub fn run(
         crate::runtime::Runtime::discover()?;
     }
     write_case(case, mesh, cfg)?;
-    let case = case.canonicalize().map_err(|e| e.to_string())?;
-    stage(backend, &case, "blockMesh", &[], token, progress)?;
+    let original_case = case.canonicalize().map_err(|e| e.to_string())?;
+    let alias = if !backend.wsl {
+        Some(crate::paths::SolverPath::new(&original_case)?)
+    } else {
+        None
+    };
+    let case = alias.as_ref().map_or(&original_case, |a| &a.path);
+    stage(backend, case, "blockMesh", &[], token, progress)?;
     stage(
         backend,
-        &case,
+        case,
         "snappyHexMesh",
         &["-overwrite"],
         token,
         progress,
     )?;
-    stage(backend, &case, "checkMesh", &[], token, progress)?;
+    stage(backend, case, "checkMesh", &[], token, progress)?;
     let mesh_log = fs::read_to_string(case.join("log.checkMesh")).map_err(|e| e.to_string())?;
     if !mesh_log.contains("Mesh OK") {
         return Err(format!(
@@ -226,10 +245,10 @@ pub fn run(
     } else {
         "simpleFoam"
     };
-    stage(backend, &case, solver, &[], token, progress)?;
+    stage(backend, case, solver, &[], token, progress)?;
     stage(
         backend,
-        &case,
+        case,
         "postProcess",
         &[
             "-dict",
@@ -243,7 +262,7 @@ pub fn run(
     )?;
     token.check()?;
     fs::write(case.join("result.foam"), b"").map_err(|e| e.to_string())?;
-    load_result(&case).inspect(|result| {
+    load_result(&original_case).inspect(|result| {
         *progress.lock().unwrap() = if cfg.model == FlowModel::UnsteadyRans {
             "Нестационарный расчёт завершён; показан последний момент".into()
         } else if result.converged {

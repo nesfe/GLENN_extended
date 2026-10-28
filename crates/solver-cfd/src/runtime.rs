@@ -29,6 +29,7 @@ struct Manifest {
 pub(crate) struct Runtime {
     root: PathBuf,
     manifest: Manifest,
+    _alias: crate::paths::SolverPath,
 }
 impl Runtime {
     pub fn discover() -> Result<Self, String> {
@@ -79,9 +80,11 @@ impl Runtime {
                 ));
             }
         }
+        let alias = crate::paths::SolverPath::new(root)?;
         Ok(Self {
-            root: root.to_path_buf(),
+            root: alias.path.clone(),
             manifest,
+            _alias: alias,
         })
     }
     pub fn command(&self, tool: &str) -> Result<Command, String> {
@@ -148,7 +151,7 @@ mod tests {
         let command = runtime.command("simpleFoam").unwrap();
         assert_eq!(
             Path::new(command.get_program()).parent().unwrap(),
-            root.join("bin")
+            runtime.root.join("bin")
         );
         assert!(runtime.command("../../other").is_err());
         manifest["libraries"] = serde_json::json!(["../outside"]);

@@ -1326,8 +1326,10 @@ dependencies = [
  "glenn-core",
  "glenn-engine",
  "glenn-io",
+ "normpath",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2050,6 +2052,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "normpath"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11ce00d2594068e8a27c9146fdc5cf9f3ac38eb42c7cd34d05fea618873ac9f"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
