@@ -102,6 +102,16 @@ jobs:
           Copy-Item -Recurse docs artifacts/package/
           Copy-Item assets/fonts/LICENSE-DejaVu.txt artifacts/package/
           Compress-Archive -Path artifacts/package/* -DestinationPath "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip"
+      - name: Bundle native Linux CFD
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/install_linux_solver.sh
+          mkdir -p artifacts/package
+          python3 scripts/bundle_linux.py /usr/lib/openfoam/openfoam2412 artifacts/package/runtime/openfoam
+          cp target/release/glenn-cfd artifacts/package/
+          # Prove the archive stands alone: remove the install before running it.
+          sudo apt-get remove -y openfoam2412 openfoam2412-common
+          python3 scripts/test_bundled_cfd.py artifacts/package/glenn-cfd tests/fixtures/cube.stl
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
