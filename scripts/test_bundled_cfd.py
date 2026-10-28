@@ -8,6 +8,9 @@ import subprocess
 import sys
 import tempfile
 
+# Solver progress is Russian; a Windows console codepage must not fail the test.
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 exe = Path(sys.argv[1]).resolve()
 fixture = Path(sys.argv[2]).resolve()
 env = {k: v for k, v in os.environ.items() if not k.startswith(('FOAM_', 'WM_', 'OPENFOAM'))}

@@ -2,6 +2,7 @@
 //! read from the same case/time; no panel field or synthetic wake is mixed in.
 mod case;
 mod field;
+mod paths;
 mod runner;
 mod runtime;
 pub use case::{Config, FlowModel, Resolution, write_case};
