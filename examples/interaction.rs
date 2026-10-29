@@ -16,6 +16,7 @@ fn main() {
         let paths = FlowField {
             analysis: &analysis,
             grid: &grid,
+            viscous: None,
         }
         .streamlines_cancellable(3, &|| token.is_cancelled())
         .ok_or("Cancelled")?;

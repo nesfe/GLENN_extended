@@ -67,6 +67,7 @@ fn incidence_changes_fixed_frame_flow_and_reverses_trailing_vorticity() {
     let positive = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     let velocity = positive.velocity(point);
     let circulation = positive.tip_circulation();
@@ -77,6 +78,7 @@ fn incidence_changes_fixed_frame_flow_and_reverses_trailing_vorticity() {
     let negative = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     assert!(velocity.distance(negative.velocity(point)) > 0.15);
     assert!((circulation + negative.tip_circulation()).abs() < 1e-6);
@@ -105,6 +107,7 @@ fn streamlines_do_not_cross_wing_and_probe_uses_the_same_velocity() {
     let field = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     let paths = field.streamlines(1);
     assert!(paths.len() > 25);
@@ -135,6 +138,7 @@ fn wake_follows_actual_tip_geometry_and_vanishes_at_zero_lift() {
     let field = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     assert!(field.tip_circulation().abs() < 1e-8);
     assert!(field.streamlines(1).iter().all(|line| !line.vortex));
@@ -148,6 +152,7 @@ fn wake_follows_actual_tip_geometry_and_vanishes_at_zero_lift() {
     let field = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     let tip = field.tip_origin(1.0);
     assert!(tip.distance(original) > changed.chord);
@@ -159,6 +164,7 @@ fn wake_follows_actual_tip_geometry_and_vanishes_at_zero_lift() {
     let field = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     assert_eq!(field.tip_circulation(), 0.0);
     assert_eq!(probe::sample(&field, [-2.0, 1.0, 0.0]).unwrap().speed, 0.0);
@@ -279,6 +285,7 @@ fn profile_thickness_and_flap_change_the_computed_flow() {
     let reference = FlowField {
         analysis: &base,
         grid: &base_grid,
+        viscous: None,
     }
     .velocity(position);
     for change in 0..3 {
@@ -293,6 +300,7 @@ fn profile_thickness_and_flap_change_the_computed_flow() {
         let field = FlowField {
             analysis: &analysis,
             grid: &grid,
+            viscous: None,
         };
         assert!(
             field.velocity(position).distance(reference) > 0.02,
@@ -323,10 +331,69 @@ fn cancellation_never_returns_a_partial_basis_or_trace_as_a_solution() {
     let field = FlowField {
         analysis: &analysis,
         grid: &grid,
+        viscous: None,
     };
     assert!(
         field
             .streamlines_cancellable(3, &|| calls.fetch_add(1, Ordering::Relaxed) > 20)
             .is_none()
+    );
+}
+
+/// The ordinary tunnel must show separation it computed, not a drawn deficit.
+/// With the viscous section supplying the plane, the three-dimensional field
+/// over a stalled wing runs backwards, an attached one does not, and the air
+/// well away from the wing keeps heading downstream in both cases.
+#[test]
+fn a_viscous_section_reverses_the_three_dimensional_field_where_it_separates() {
+    use glenn_extended::{geometry::SectionFrame, viscous::Section};
+    use glenn_solver_native::{Config, Solver};
+    use std::sync::Arc;
+    let over_the_wing = |alpha: f64| {
+        let state = Simulation {
+            alpha,
+            ..Simulation::default()
+        };
+        let analysis = Analysis::new(state.clone()).unwrap();
+        let grid = SectionGrid::new(&analysis.foil, &analysis.panel);
+        let mut solver = Solver::new(Config::airfoil(&analysis.foil, alpha, 1.0e6, 24)).unwrap();
+        solver.advance(1000).unwrap();
+        let section = Section::new(Arc::new(solver.snapshot()), alpha);
+        let field = FlowField {
+            analysis: &analysis,
+            grid: &grid,
+            viscous: Some(&section),
+        };
+        let frame = SectionFrame::at(&state, 0.0);
+        // The separated region has a size; scan the air just over the suction
+        // surface rather than betting on one point inside it.
+        let mut reversed = 0;
+        for chordwise in 0..15 {
+            let x = 0.25 + chordwise as f64 * 0.05;
+            let surface = glenn_extended::geometry::interpolate(&analysis.foil.upper, x);
+            for step in 0..8 {
+                let height = 0.02 + step as f64 * 0.04;
+                let point = frame.to_world(Point::new(x, surface + height));
+                if field.velocity(point).x < 0.0 {
+                    reversed += 1;
+                }
+            }
+        }
+        (
+            reversed,
+            field.velocity(frame.to_world(Point::new(-2.0, 1.2))),
+        )
+    };
+    let (stalled, stalled_far) = over_the_wing(24.0);
+    let (attached, attached_far) = over_the_wing(2.0);
+    // The laminar lattice also detaches a little near the trailing edge of an
+    // attached section, so the test is the growth with incidence, not absence.
+    assert!(
+        stalled > 20 && stalled > 4 * attached,
+        "separation must grow with incidence: {stalled} stalled vs {attached} attached"
+    );
+    assert!(
+        stalled_far.x > 0.5 && attached_far.x > 0.5,
+        "undisturbed air must stay downstream: {stalled_far:?} {attached_far:?}"
     );
 }

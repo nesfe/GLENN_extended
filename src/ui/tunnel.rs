@@ -141,7 +141,13 @@ pub struct Tunnel {
     clock: f64,
     last_time: Option<f64>,
 }
-pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mut Tunnel) {
+pub fn show(
+    ui: &mut egui::Ui,
+    analysis: &Analysis,
+    view: &mut View,
+    tunnel: &mut Tunnel,
+    viscous: bool,
+) {
     ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new("Аэродинамическая труба")
@@ -177,8 +183,12 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
             ui.label("Пересчёт… Показан последний завершённый результат.");
         });
     }
-    if analysis.current.stall_fraction > 0.12 {
-        ui.colored_label(AMBER, "Панельный режим: отрыв не решается. Для вязкого отрыва используйте вкладку «Объёмная CFD».");
+    if analysis.current.mach > 0.75 {
+        ui.colored_label(AMBER, "За пределами применимости: эти линии не показывают ударные волны и вязкий отрыв. Объёмный несжимаемый CFD также не подходит для этого числа Маха.");
+    } else if viscous {
+        ui.colored_label(CYAN, "Линии прослежены через вязкий расчёт сечения; малиновым на крыле — оторванная обшивка. Поле решено для корневого сечения и применено по размаху, поэтому крутка в нём не учитывается.");
+    } else if analysis.current.stall_fraction > 0.12 {
+        ui.colored_label(AMBER, "Панельный режим: отрыв не решается, след нарисован по эмпирической оценке. Вязкий отрыв — на вкладках «Вязкий расчёт» и «Объёмная CFD».");
     }
     let height = (ui.available_height() - 110.0).clamp(280.0, 620.0);
     let (rect, response) =
@@ -377,7 +387,11 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
         Color32::from_rgb(9, 17, 27),
     );
     if let Some(grid) = &tunnel.grid {
-        let field = glenn_extended::physics::flow::FlowField { analysis, grid };
+        let field = glenn_extended::physics::flow::FlowField {
+            analysis,
+            grid,
+            viscous: None,
+        };
         painter.text(
             rect.left_top() + Vec2::new(16.0, 39.0),
             egui::Align2::LEFT_TOP,
@@ -401,7 +415,11 @@ pub fn show(ui: &mut egui::Ui, analysis: &Analysis, view: &mut View, tunnel: &mu
     painter.text(
         rect.left_bottom() + Vec2::new(16.0, -14.0),
         egui::Align2::LEFT_BOTTOM,
-        "Панельное поле + приближённый след · единицы: м",
+        if viscous {
+            "Вязкое поле сечения по размаху + концевые вихри · единицы: м"
+        } else {
+            "Панельное поле + приближённый след · единицы: м"
+        },
         egui::FontId::proportional(11.0),
         MUTED,
     );

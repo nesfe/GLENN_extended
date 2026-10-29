@@ -12,7 +12,7 @@ use std::{
 };
 #[derive(Clone, Debug, Default)]
 pub struct Backend {
-    /// Optional OpenFOAM etc/bashrc. Empty means commands are already on PATH.
+    /// Expert override. Empty selects the runtime bundled beside the executable.
     pub bashrc: String,
     /// Windows uses an installed WSL distribution; all paths passed as argv.
     pub wsl: bool,
@@ -43,7 +43,13 @@ fn posix_path(path: &Path, wsl: bool) -> Result<String, String> {
     Ok(text.into())
 }
 impl Backend {
-    fn command(&self, tool: &str, case: &Path, args: &[&str]) -> Result<Command, String> {
+    fn command(
+        &self,
+        tool: &str,
+        case: &Path,
+        args: &[&str],
+        runtime: Option<&crate::runtime::Runtime>,
+    ) -> Result<Command, String> {
         let case_path = posix_path(case, self.wsl)?;
         // No interpolated shell text. The script is constant; every path and
         // argument is passed positionally, including spaces and shell characters.
@@ -76,9 +82,19 @@ wait "$pid"
             c.args(["--noprofile", "--norc", "-c", script, "glenn"]);
             c
         } else {
-            let mut c = Command::new(tool);
+            let mut c = runtime
+                .ok_or("Комплектный решатель не подготовлен")?
+                .command(tool)?;
             c.arg("-case").arg(&case_path);
             c.args(args);
+            // OpenFOAM validates its inherited cwd too. Use the ASCII parent
+            // of our alias, not the user's installation/working directory.
+            c.current_dir(case.parent().ok_or("Нет рабочего каталога решателя")?);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
             return Ok(c);
         };
         cmd.arg(&self.bashrc)
@@ -88,6 +104,36 @@ wait "$pid"
             .arg(case_path)
             .args(args);
         Ok(cmd)
+    }
+}
+// WSL emits UTF-16 on Windows, whereas solver logs are UTF-8. Never silently
+// discard the diagnostic because read_to_string rejected its encoding.
+fn decode_log(bytes: &[u8]) -> String {
+    let utf16 = bytes.starts_with(&[0xff, 0xfe])
+        || (bytes.len() >= 8
+            && bytes.chunks_exact(2).take(64).filter(|c| c[1] == 0).count()
+                > bytes.len().min(128) / 8);
+    if utf16 {
+        let bytes = bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes);
+        String::from_utf16_lossy(
+            &bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+#[cfg(test)]
+mod log_tests {
+    use super::decode_log;
+    #[test]
+    fn windows_and_native_diagnostics_remain_readable() {
+        let message = "WSL: нет установленных дистрибутивов. wsl.exe --install";
+        let encoded: Vec<_> = message.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_log(&encoded), message);
+        assert_eq!(decode_log(message.as_bytes()), message);
     }
 }
 fn stage(
@@ -107,8 +153,13 @@ fn stage(
     let log_path = case.join(format!("log.{log_name}"));
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut child=backend.command(tool,case,args)?.stdout(Stdio::from(log)).stderr(Stdio::from(err)).spawn()
-        .map_err(|e|format!("Не удалось запустить {tool}: {e}. Установите OpenFOAM и укажите etc/bashrc (Windows — через WSL)."))?;
+    let runtime = if backend.bashrc.is_empty() && !backend.wsl {
+        Some(crate::runtime::Runtime::discover()?)
+    } else {
+        None
+    };
+    let mut child=backend.command(tool,case,args,runtime.as_ref())?.stdout(Stdio::from(log)).stderr(Stdio::from(err)).spawn()
+        .map_err(|e|format!("Не удалось запустить {tool}: {e}. Проверьте целостность полного архива GLENN и журнал запуска."))?;
     let mut reported = Instant::now();
     loop {
         if token.is_cancelled() {
@@ -123,7 +174,7 @@ fn stage(
             if status.success() {
                 break;
             }
-            let log = fs::read_to_string(&log_path).unwrap_or_default();
+            let log = decode_log(&fs::read(&log_path).unwrap_or_default());
             let tail = log
                 .lines()
                 .rev()
@@ -169,18 +220,27 @@ pub fn run(
     progress: &Arc<Mutex<String>>,
 ) -> Result<RunResult, String> {
     token.check()?;
+    if backend.bashrc.is_empty() && !backend.wsl {
+        crate::runtime::Runtime::discover()?;
+    }
     write_case(case, mesh, cfg)?;
-    let case = case.canonicalize().map_err(|e| e.to_string())?;
-    stage(backend, &case, "blockMesh", &[], token, progress)?;
+    let original_case = case.canonicalize().map_err(|e| e.to_string())?;
+    let alias = if !backend.wsl {
+        Some(crate::paths::SolverPath::new(&original_case)?)
+    } else {
+        None
+    };
+    let case = alias.as_ref().map_or(&original_case, |a| &a.path);
+    stage(backend, case, "blockMesh", &[], token, progress)?;
     stage(
         backend,
-        &case,
+        case,
         "snappyHexMesh",
         &["-overwrite"],
         token,
         progress,
     )?;
-    stage(backend, &case, "checkMesh", &[], token, progress)?;
+    stage(backend, case, "checkMesh", &[], token, progress)?;
     let mesh_log = fs::read_to_string(case.join("log.checkMesh")).map_err(|e| e.to_string())?;
     if !mesh_log.contains("Mesh OK") {
         return Err(format!(
@@ -193,10 +253,10 @@ pub fn run(
     } else {
         "simpleFoam"
     };
-    stage(backend, &case, solver, &[], token, progress)?;
+    stage(backend, case, solver, &[], token, progress)?;
     stage(
         backend,
-        &case,
+        case,
         "postProcess",
         &[
             "-dict",
@@ -210,7 +270,7 @@ pub fn run(
     )?;
     token.check()?;
     fs::write(case.join("result.foam"), b"").map_err(|e| e.to_string())?;
-    load_result(&case).inspect(|result| {
+    load_result(&original_case).inspect(|result| {
         *progress.lock().unwrap() = if cfg.model == FlowModel::UnsteadyRans {
             "Нестационарный расчёт завершён; показан последний момент".into()
         } else if result.converged {

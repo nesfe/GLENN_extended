@@ -2,6 +2,7 @@
 //! become unreachable. Narrow windows put controls on a dedicated page.
 mod controls;
 mod jobs;
+mod native;
 mod pages;
 mod plots;
 mod render;
@@ -19,7 +20,7 @@ use glenn_extended::{
     },
 };
 use plots::{AMBER, CYAN, MUTED};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone)]
 pub struct Capture {
@@ -32,6 +33,8 @@ pub struct Capture {
     pub scroll_end: bool,
     pub alpha: Option<f64>,
     pub camera: usize,
+    pub native_steps: u64,
+    pub native_3d: bool,
     pub input: Option<PathBuf>,
     pub cfd_case: Option<PathBuf>,
 }
@@ -52,6 +55,10 @@ impl Capture {
             cfd_case: value("--cfd-case").map(PathBuf::from),
             scroll_end: args.iter().any(|arg| arg == "--scroll-end"),
             alpha: value("--alpha").and_then(|s| s.parse().ok()),
+            native_steps: value("--native-steps")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(504),
+            native_3d: args.iter().any(|arg| arg == "--native-3d"),
             camera: value("--camera").and_then(|s| s.parse().ok()).unwrap_or(0),
             control_tab: value("--control-tab")
                 .and_then(|s| s.parse().ok())
@@ -76,6 +83,12 @@ pub struct Workbench {
     view: tunnel::View,
     tunnel: tunnel::Tunnel,
     volume_flow: volume::Volume,
+    native_flow: native::Native,
+    potential_view: bool,
+    /// The viscous field the drawn scene was traced through, and when it was
+    /// taken, so a fast solver cannot outrun the tracer.
+    scene_field: Option<Arc<glenn_solver_native::Snapshot>>,
+    scene_tick: std::time::Instant,
     page: usize,
     control_tab: usize,
     preset: usize,
@@ -146,7 +159,8 @@ impl Workbench {
         }
         let mut app = Self::with_state(starting_state);
         if let Some(capture) = &capture {
-            app.page = capture.page.min(7);
+            app.page = capture.page.min(8);
+            app.native_flow.three_d = capture.native_3d;
             app.control_tab = capture.control_tab.min(3);
             app.preset = capture.preset.min(app.presets.len() - 1);
             app.view.animate = false;
@@ -160,6 +174,10 @@ impl Workbench {
             creation.egui_ctx.set_zoom_factor(capture.scale);
         }
         app.tunnel.renderer = creation
+            .wgpu_render_state
+            .clone()
+            .map(render::Renderer::new);
+        app.native_flow.renderer = creation
             .wgpu_render_state
             .clone()
             .map(render::Renderer::new);
@@ -205,6 +223,10 @@ impl Workbench {
             view: tunnel::View::default(),
             tunnel: tunnel::Tunnel::default(),
             volume_flow: volume::Volume::default(),
+            native_flow: native::Native::default(),
+            potential_view: false,
+            scene_field: None,
+            scene_tick: std::time::Instant::now(),
             page: 0,
             control_tab: 0,
             preset: 0,
@@ -267,6 +289,7 @@ impl Workbench {
         let data = match extension {
             "json" => interchange::save_project(&self.state),
             "dat" => Ok(interchange::export_dat(&self.analysis)),
+            "csv" if self.page == 8 => self.native_flow.export_csv(&self.analysis),
             "csv" => Ok(interchange::export_csv(&self.analysis)),
             "obj" => Ok(interchange::export_obj(&self.analysis.mesh)),
             "stl" => Ok(interchange::export_stl(&self.analysis.mesh)),
@@ -288,11 +311,39 @@ impl Workbench {
             }
         }
     }
+    /// Whether the native viscous solver feeds what is on screen: the tunnel
+    /// streamlines, or the section view itself.
+    fn viscous_active(&self) -> bool {
+        self.page == 8 || (self.page == 0 && !self.potential_view)
+    }
     fn recalculate(&mut self) {
+        // Re-tracing the scene on every lattice publication would run faster
+        // than the eye follows and keep the worker permanently busy; ten
+        // updates a second already reads as a developing flow.
+        // A headless capture waits for an idle worker, so once the requested
+        // step is reached the field is held still and the tracer can finish.
+        let frozen = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| self.native_flow.ready(capture.native_steps));
+        if self.potential_view || self.page != 0 {
+            self.scene_field = None;
+        } else if !frozen
+            && self.scene_tick.elapsed() >= Duration::from_millis(100)
+            && let Some(current) = &self.native_flow.snapshot
+            && self
+                .scene_field
+                .as_ref()
+                .is_none_or(|shown| !Arc::ptr_eq(shown, current))
+        {
+            self.scene_field = Some(current.clone());
+            self.scene_tick = std::time::Instant::now();
+        }
         let request = jobs::Request {
             state: self.state.clone(),
             view: self.view.clone(),
-            scene: self.tunnel.renderer.is_some(),
+            scene: self.page == 0 && self.tunnel.renderer.is_some(),
+            viscous: self.scene_field.clone(),
         };
         if self
             .requested
@@ -387,21 +438,21 @@ impl Workbench {
                 });
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
+                    // Explicit indices: the section view was added last but
+                    // belongs beside the tunnel it shares a solver with.
                     for (i, label) in [
-                        "3D-труба",
-                        "Профиль",
-                        "Графики",
-                        "Полёт",
-                        "Файлы",
-                        "О модели",
-                        "Параметры",
-                        "Объёмная CFD",
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
+                        (0, "3D-труба"),
+                        (8, "Сечение"),
+                        (1, "Профиль"),
+                        (2, "Графики"),
+                        (3, "Полёт"),
+                        (4, "Файлы"),
+                        (5, "О модели"),
+                        (6, "Параметры"),
+                        (7, "Объёмная CFD"),
+                    ] {
                         if i != 6 || compact {
-                            ui.selectable_value(&mut self.page, i, *label);
+                            ui.selectable_value(&mut self.page, i, label);
                         }
                     }
                 });
@@ -480,6 +531,9 @@ impl eframe::App for Workbench {
         self.poll_import();
         self.volume_flow.poll(ctx);
         self.draw(ctx);
+        if !self.viscous_active() {
+            self.native_flow.suspend();
+        }
         if self.tunnel.busy || self.importing {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -511,7 +565,11 @@ impl eframe::App for Workbench {
         if let Some(audio) = &self.audio {
             audio.update(
                 self.state.velocity,
-                self.analysis.current.stall_fraction,
+                if self.viscous_active() {
+                    self.native_flow.reverse_strength()
+                } else {
+                    self.analysis.current.stall_fraction
+                },
                 self.volume,
             );
         }
@@ -524,6 +582,7 @@ impl eframe::App for Workbench {
                 && !self.tunnel.busy
                 && !self.importing
                 && !self.volume_flow.pending()
+                && (!self.viscous_active() || self.native_flow.ready(capture.native_steps))
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
@@ -633,8 +692,10 @@ mod tests {
             let ctx = egui::Context::default();
             style(&ctx);
             let mut app = Workbench::with_state(Simulation::default());
-            for scenario in 0..12 {
-                let page = if scenario == 11 {
+            for scenario in 0..13 {
+                let page = if scenario == 12 {
+                    8
+                } else if scenario == 11 {
                     7
                 } else if scenario == 10 {
                     0

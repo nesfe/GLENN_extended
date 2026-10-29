@@ -17,3 +17,4 @@ unsafe_code = "forbid"
 
 [dev-dependencies]
 glenn-io = { path = "../io" }
+tempfile = "3.27.0"
