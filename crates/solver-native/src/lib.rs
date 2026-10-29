@@ -454,6 +454,16 @@ mod tests {
         assert!((a.lift + b.lift).abs() < 0.01);
         assert!((a.drag - b.drag).abs() < 0.01);
         assert!((a.mean_density - 1.0).abs() < 0.01);
+        let seed = (0..a.velocity.len())
+            .find_map(|i| {
+                let p = a.point(i % a.width, i / a.width);
+                a.sample(p[0], p[1]).filter(|u| u[0] < -0.1).map(|_| p)
+            })
+            .expect("a resolved reverse-flow seed");
+        let path = a.trace(seed);
+        assert!(path.len() > 1 && path[1][0] < path[0][0]);
+        assert!(path.iter().all(|p| a.sample(p[0], p[1]).is_some()));
+
         // Away from the body the inlet stays downstream; the entire field
         // must not be reversed by an angle-dependent visual effect.
         assert!(a.sample(-1.0, 1.0).unwrap()[0] > 0.9);

@@ -18,7 +18,7 @@ pub struct Native {
     pub paused: bool,
     cells: usize,
     quantity: usize,
-    three_d: bool,
+    pub(super) three_d: bool,
     yaw: f32,
     pitch: f32,
     texture: Option<egui::TextureHandle>,
@@ -131,8 +131,13 @@ impl Native {
     pub fn suspend(&self) {
         self.worker.pause(true);
     }
-    pub fn ready(&self) -> bool {
-        self.error.is_some() || self.snapshot.as_ref().is_some_and(|s| s.step >= 504)
+    pub fn reverse_strength(&self) -> f64 {
+        self.snapshot
+            .as_ref()
+            .map_or(0.0, |s| (-s.min_ux as f64).clamp(0.0, 1.0))
+    }
+    pub fn ready(&self, steps: u64) -> bool {
+        self.error.is_some() || self.snapshot.as_ref().is_some_and(|s| s.step >= steps)
     }
     pub fn show(&mut self, ui: &mut egui::Ui, analysis: &Analysis) {
         ui.horizontal_wrapped(|ui| {
@@ -396,5 +401,36 @@ impl Native {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(33));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exported_viscous_field_uses_si_units_and_rejects_changed_geometry() {
+        let mut analysis = Analysis::new(glenn_extended::model::Simulation::default()).unwrap();
+        let re = analysis.state.velocity * analysis.state.chord * analysis.atmosphere.density
+            / analysis.atmosphere.viscosity;
+        let config = Config::airfoil(&analysis.foil, analysis.state.alpha, re, 40);
+        let solver = glenn_solver_native::Solver::new(config.clone()).unwrap();
+        let view = Native {
+            config: Some(config),
+            snapshot: Some(Arc::new(solver.snapshot())),
+            ..Native::default()
+        };
+        let csv = view.export_csv(&analysis).unwrap();
+        let row: Vec<f64> = csv
+            .lines()
+            .nth(2)
+            .unwrap()
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert!((row[2] - analysis.state.velocity).abs() < 0.001);
+        assert!(row[3].abs() < 0.001);
+        assert!(row[4].abs() < 0.1);
+        analysis.state.alpha += 1.0;
+        assert!(view.export_csv(&analysis).is_err());
     }
 }
