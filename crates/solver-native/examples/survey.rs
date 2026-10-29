@@ -17,7 +17,8 @@ fn main() {
     ))
     .unwrap();
     let start = std::time::Instant::now();
-    for _ in 0..12 {
+    let batches = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(12);
+    for _ in 0..batches {
         solver.advance(500).unwrap();
         let s = solver.snapshot();
         println!(

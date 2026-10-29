@@ -33,6 +33,8 @@ pub struct Capture {
     pub scroll_end: bool,
     pub alpha: Option<f64>,
     pub camera: usize,
+    pub native_steps: u64,
+    pub native_3d: bool,
     pub input: Option<PathBuf>,
     pub cfd_case: Option<PathBuf>,
 }
@@ -53,6 +55,10 @@ impl Capture {
             cfd_case: value("--cfd-case").map(PathBuf::from),
             scroll_end: args.iter().any(|arg| arg == "--scroll-end"),
             alpha: value("--alpha").and_then(|s| s.parse().ok()),
+            native_steps: value("--native-steps")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(504),
+            native_3d: args.iter().any(|arg| arg == "--native-3d"),
             camera: value("--camera").and_then(|s| s.parse().ok()).unwrap_or(0),
             control_tab: value("--control-tab")
                 .and_then(|s| s.parse().ok())
@@ -150,6 +156,7 @@ impl Workbench {
         let mut app = Self::with_state(starting_state);
         if let Some(capture) = &capture {
             app.page = capture.page.min(7);
+            app.native_flow.three_d = capture.native_3d;
             app.control_tab = capture.control_tab.min(3);
             app.preset = capture.preset.min(app.presets.len() - 1);
             app.view.animate = false;
@@ -526,7 +533,11 @@ impl eframe::App for Workbench {
         if let Some(audio) = &self.audio {
             audio.update(
                 self.state.velocity,
-                self.analysis.current.stall_fraction,
+                if self.page == 0 && !self.potential_view {
+                    self.native_flow.reverse_strength()
+                } else {
+                    self.analysis.current.stall_fraction
+                },
                 self.volume,
             );
         }
@@ -539,7 +550,9 @@ impl eframe::App for Workbench {
                 && !self.tunnel.busy
                 && !self.importing
                 && !self.volume_flow.pending()
-                && (self.page != 0 || self.potential_view || self.native_flow.ready())
+                && (self.page != 0
+                    || self.potential_view
+                    || self.native_flow.ready(capture.native_steps))
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
