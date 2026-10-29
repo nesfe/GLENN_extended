@@ -38,12 +38,25 @@ pub struct Config {
     pub alpha: f64,
     pub contour: Vec<Point>,
 }
+/// The Reynolds number this many cells per chord can honestly carry. The wall
+/// is a staircase of whole cells, so unless the boundary layer is several
+/// cells thick that staircase acts as roughness its own size and the section
+/// separates at every incidence. Blasius puts the layer at delta/c ~ 5/sqrt(Re),
+/// and holding about nine cells inside it gives this cap. Measured: at 40 cells
+/// a flight Reynolds number detaches a 4° section, while this cap keeps it
+/// attached and still separates it at 16°.
+pub fn resolved_reynolds(chord_cells: usize) -> f64 {
+    0.3 * (chord_cells * chord_cells) as f64
+}
+
 impl Config {
+    /// Reynolds is capped at what the grid resolves; the caller keeps the
+    /// flight value for display and must not present this as that flow.
     pub fn airfoil(foil: &Airfoil, alpha: f64, reynolds: f64, chord_cells: usize) -> Self {
         Self {
             contour: foil.contour(),
             alpha,
-            reynolds,
+            reynolds: reynolds.min(resolved_reynolds(chord_cells)),
             chord_cells,
         }
     }

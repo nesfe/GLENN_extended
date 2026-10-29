@@ -193,6 +193,63 @@ impl Native {
                     }
                 });
         });
+        if let Err(message) = self.advance(analysis) {
+            ui.colored_label(AMBER, message);
+            return;
+        }
+        if let Some(e) = &self.error {
+            ui.colored_label(AMBER, e);
+        }
+        let Some(f) = self.snapshot.as_ref() else {
+            ui.spinner();
+            ui.label("Запуск потока…");
+            ui.ctx().request_repaint();
+            return;
+        };
+        let q = analysis.atmosphere.dynamic_pressure;
+        let state = &analysis.state;
+        self.draw(ui, f.clone(), state, q, analysis);
+    }
+
+    /// Compact controls for the three-dimensional tunnel, where the section
+    /// view with its own toolbar is not on screen.
+    pub fn controls(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(if self.paused {
+                "Продолжить"
+            } else {
+                "Пауза"
+            })
+            .clicked()
+        {
+            self.paused = !self.paused;
+        }
+        egui::ComboBox::from_id_salt("native_tunnel_cells")
+            .width(165.0)
+            .selected_text(format!("{} ячеек / хорду", self.cells))
+            .show_ui(ui, |ui| {
+                for n in [32, 40, 64, 96] {
+                    ui.selectable_value(&mut self.cells, n, format!("{n} ячеек / хорду"));
+                }
+            });
+        if let Some(f) = &self.snapshot {
+            // Section coefficients from momentum exchange on the skin: they
+            // belong to this plane, not to the finite wing the cards above show.
+            ui.small(format!(
+                "сечение: cℓ = {:.2} · cd = {:.2} · Re расчёта {:.0} · tU/c = {:.2} · min Ux/U∞ = {:.2}",
+                f.lift,
+                f.drag,
+                self.config.as_ref().map_or(0.0, |c| c.reynolds),
+                f.time,
+                f.min_ux
+            ));
+        }
+    }
+
+    /// Keep the solver fed and collect its latest field. Separate from drawing
+    /// so the three-dimensional tunnel runs the same computation without the
+    /// section view being open.
+    pub fn advance(&mut self, analysis: &Analysis) -> Result<(), String> {
         let state = &analysis.state;
         let re = state.velocity * state.chord * analysis.atmosphere.density
             / analysis.atmosphere.viscosity;
@@ -214,8 +271,7 @@ impl Native {
             self.config = None;
             self.snapshot = None;
             self.error = Some(message.into());
-            ui.colored_label(AMBER, message);
-            return;
+            return Err(message.into());
         }
         let config = Config::airfoil(&analysis.foil, state.alpha, re, self.cells);
         if self.config.as_ref() != Some(&config) {
@@ -236,23 +292,28 @@ impl Native {
                 Err(e) => self.error = Some(e),
             }
         }
-        if let Some(e) = &self.error {
-            ui.colored_label(AMBER, e);
-        }
-        let Some(f) = self.snapshot.as_ref() else {
-            ui.spinner();
-            ui.label("Запуск потока…");
-            ui.ctx().request_repaint();
-            return;
-        };
-        let q = analysis.atmosphere.dynamic_pressure;
+        Ok(())
+    }
+
+    fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        f: Arc<Snapshot>,
+        state: &glenn_extended::model::Simulation,
+        q: f64,
+        analysis: &Analysis,
+    ) {
+        let f = &f;
+        let re = state.velocity * state.chord * analysis.atmosphere.density
+            / analysis.atmosphere.viscosity;
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new(format!("Сечение: cℓ = {:.3} · cd = {:.3}", f.lift, f.drag))
                     .color(CYAN),
             );
             ui.label(format!(
-                "Re = {re:.2e} · tU/c = {:.2} · {:.2} с",
+                "Re расчёта = {:.0} · Re полёта = {re:.2e} · tU/c = {:.2} · {:.2} с",
+                glenn_solver_native::resolved_reynolds(self.cells).min(re),
                 f.time,
                 f.time * state.chord / state.velocity
             ));
@@ -360,6 +421,31 @@ impl Native {
             let project = |x: f32, y: f32| {
                 egui::pos2(view.left() + (x + 0.7) * scale, view.center().y - y * scale)
             };
+            // The lattice mask is cell-stepped, so the body reads as a staircase.
+            // Draw the contour the mask was built from over it: the same rotation
+            // about the quarter chord, so outline and solid cells coincide.
+            if let Some(config) = &self.config {
+                let (s, c) = (-config.alpha.to_radians()).sin_cos();
+                let body: Vec<_> = config
+                    .contour
+                    .iter()
+                    .map(|p| {
+                        project(
+                            (0.25 + (p.x - 0.25) * c - p.y * s) as f32,
+                            ((p.x - 0.25) * s + p.y * c) as f32,
+                        )
+                    })
+                    .collect();
+                painter
+                    .with_clip_rect(view)
+                    .add(egui::Shape::Path(egui::epaint::PathShape {
+                        points: body,
+                        closed: true,
+                        fill: Color32::from_rgb(225, 234, 240),
+                        // Wide enough to cover the staircase edge of the mask beneath it.
+                        stroke: egui::Stroke::new(2.5, Color32::from_rgb(225, 234, 240)).into(),
+                    }));
+            }
             for path in &self.paths {
                 let points: Vec<_> = path.iter().map(|p| project(p[0], p[1])).collect();
                 painter.with_clip_rect(view).add(egui::Shape::line(

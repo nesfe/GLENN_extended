@@ -20,7 +20,7 @@ use glenn_extended::{
     },
 };
 use plots::{AMBER, CYAN, MUTED};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone)]
 pub struct Capture {
@@ -85,6 +85,10 @@ pub struct Workbench {
     volume_flow: volume::Volume,
     native_flow: native::Native,
     potential_view: bool,
+    /// The viscous field the drawn scene was traced through, and when it was
+    /// taken, so a fast solver cannot outrun the tracer.
+    scene_field: Option<Arc<glenn_solver_native::Snapshot>>,
+    scene_tick: std::time::Instant,
     page: usize,
     control_tab: usize,
     preset: usize,
@@ -155,7 +159,7 @@ impl Workbench {
         }
         let mut app = Self::with_state(starting_state);
         if let Some(capture) = &capture {
-            app.page = capture.page.min(7);
+            app.page = capture.page.min(8);
             app.native_flow.three_d = capture.native_3d;
             app.control_tab = capture.control_tab.min(3);
             app.preset = capture.preset.min(app.presets.len() - 1);
@@ -221,6 +225,8 @@ impl Workbench {
             volume_flow: volume::Volume::default(),
             native_flow: native::Native::default(),
             potential_view: false,
+            scene_field: None,
+            scene_tick: std::time::Instant::now(),
             page: 0,
             control_tab: 0,
             preset: 0,
@@ -283,9 +289,7 @@ impl Workbench {
         let data = match extension {
             "json" => interchange::save_project(&self.state),
             "dat" => Ok(interchange::export_dat(&self.analysis)),
-            "csv" if self.page == 0 && !self.potential_view => {
-                self.native_flow.export_csv(&self.analysis)
-            }
+            "csv" if self.page == 8 => self.native_flow.export_csv(&self.analysis),
             "csv" => Ok(interchange::export_csv(&self.analysis)),
             "obj" => Ok(interchange::export_obj(&self.analysis.mesh)),
             "stl" => Ok(interchange::export_stl(&self.analysis.mesh)),
@@ -307,11 +311,39 @@ impl Workbench {
             }
         }
     }
+    /// Whether the native viscous solver feeds what is on screen: the tunnel
+    /// streamlines, or the section view itself.
+    fn viscous_active(&self) -> bool {
+        self.page == 8 || (self.page == 0 && !self.potential_view)
+    }
     fn recalculate(&mut self) {
+        // Re-tracing the scene on every lattice publication would run faster
+        // than the eye follows and keep the worker permanently busy; ten
+        // updates a second already reads as a developing flow.
+        // A headless capture waits for an idle worker, so once the requested
+        // step is reached the field is held still and the tracer can finish.
+        let frozen = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| self.native_flow.ready(capture.native_steps));
+        if self.potential_view || self.page != 0 {
+            self.scene_field = None;
+        } else if !frozen
+            && self.scene_tick.elapsed() >= Duration::from_millis(100)
+            && let Some(current) = &self.native_flow.snapshot
+            && self
+                .scene_field
+                .as_ref()
+                .is_none_or(|shown| !Arc::ptr_eq(shown, current))
+        {
+            self.scene_field = Some(current.clone());
+            self.scene_tick = std::time::Instant::now();
+        }
         let request = jobs::Request {
             state: self.state.clone(),
             view: self.view.clone(),
-            scene: self.potential_view && self.page == 0 && self.tunnel.renderer.is_some(),
+            scene: self.page == 0 && self.tunnel.renderer.is_some(),
+            viscous: self.scene_field.clone(),
         };
         if self
             .requested
@@ -406,21 +438,21 @@ impl Workbench {
                 });
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
+                    // Explicit indices: the section view was added last but
+                    // belongs beside the tunnel it shares a solver with.
                     for (i, label) in [
-                        "3D-труба",
-                        "Профиль",
-                        "Графики",
-                        "Полёт",
-                        "Файлы",
-                        "О модели",
-                        "Параметры",
-                        "Объёмная CFD",
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
+                        (0, "3D-труба"),
+                        (8, "Сечение"),
+                        (1, "Профиль"),
+                        (2, "Графики"),
+                        (3, "Полёт"),
+                        (4, "Файлы"),
+                        (5, "О модели"),
+                        (6, "Параметры"),
+                        (7, "Объёмная CFD"),
+                    ] {
                         if i != 6 || compact {
-                            ui.selectable_value(&mut self.page, i, *label);
+                            ui.selectable_value(&mut self.page, i, label);
                         }
                     }
                 });
@@ -499,7 +531,7 @@ impl eframe::App for Workbench {
         self.poll_import();
         self.volume_flow.poll(ctx);
         self.draw(ctx);
-        if self.page != 0 || self.potential_view {
+        if !self.viscous_active() {
             self.native_flow.suspend();
         }
         if self.tunnel.busy || self.importing {
@@ -533,7 +565,7 @@ impl eframe::App for Workbench {
         if let Some(audio) = &self.audio {
             audio.update(
                 self.state.velocity,
-                if self.page == 0 && !self.potential_view {
+                if self.viscous_active() {
                     self.native_flow.reverse_strength()
                 } else {
                     self.analysis.current.stall_fraction
@@ -550,9 +582,7 @@ impl eframe::App for Workbench {
                 && !self.tunnel.busy
                 && !self.importing
                 && !self.volume_flow.pending()
-                && (self.page != 0
-                    || self.potential_view
-                    || self.native_flow.ready(capture.native_steps))
+                && (!self.viscous_active() || self.native_flow.ready(capture.native_steps))
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }

@@ -9,6 +9,7 @@ use glenn_extended::{
         flight::{self, Performance},
         flow::{self, FlowField, SectionGrid, Streamline},
     },
+    viscous::Section,
 };
 use std::sync::Arc;
 #[derive(Clone)]
@@ -16,12 +17,20 @@ pub struct Request {
     pub state: Simulation,
     pub view: View,
     pub scene: bool,
+    /// The viscous plane the streamlines are traced through. None leaves the
+    /// panel solution in charge, which is the explicitly separate estimate.
+    pub viscous: Option<Arc<glenn_solver_native::Snapshot>>,
 }
 impl Request {
     pub fn same(&self, other: &Self) -> bool {
         self.state == other.state
             && self.scene == other.scene
             && style(&self.view) == style(&other.view)
+            && match (&self.viscous, &other.viscous) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 }
 fn style(v: &View) -> (bool, bool, bool, bool, usize, usize) {
@@ -61,18 +70,34 @@ pub fn worker(initial: Analysis) -> Worker<Request, Snapshot> {
                 key = None;
             }
             cancel.check()?;
-            let flow_key = (flow::field_fingerprint(&analysis), request.view.density);
+            let section = request
+                .viscous
+                .as_ref()
+                .map(|field| Section::new(field.clone(), analysis.state.alpha));
+            // The viscous plane advances in time, so its step belongs in the
+            // key: the same geometry at a later step is a different field.
+            let flow_key = (
+                flow::field_fingerprint(&analysis),
+                request.view.density,
+                request.viscous.as_ref().map(|field| field.step),
+            );
             if key != Some(flow_key) {
                 paths = FlowField {
                     analysis: &analysis,
                     grid: grid.as_ref().unwrap(),
+                    viscous: section.as_ref().map(|s| s as &dyn flow::SectionField),
                 }
                 .streamlines_cancellable(request.view.density, &|| cancel.is_cancelled())
                 .ok_or("Расчёт отменён")?;
                 key = Some(flow_key);
             }
             cancel.check()?;
-            Some(Scene::new(&analysis, &paths, &request.view))
+            Some(Scene::new(
+                &analysis,
+                &paths,
+                &request.view,
+                section.as_ref().map(|s| s as &dyn flow::SectionField),
+            ))
         } else {
             None
         };
