@@ -1289,7 +1289,7 @@ version = "0.1.0"
 
 [[package]]
 name = "glenn-extended"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "bytemuck",
  "cpal",
