@@ -34,6 +34,9 @@ impl Workbench {
             if !self.potential_view {
                 if self.analysis.state == self.state {
                     self.native_flow.show(ui, &self.analysis);
+                    if std::mem::take(&mut self.native_flow.export_requested) {
+                        self.export("csv");
+                    }
                 } else {
                     self.native_flow.suspend();
                     ui.spinner();

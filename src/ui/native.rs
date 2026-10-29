@@ -16,6 +16,7 @@ pub struct Native {
     pub snapshot: Option<Arc<Snapshot>>,
     error: Option<String>,
     pub paused: bool,
+    pub export_requested: bool,
     cells: usize,
     quantity: usize,
     pub(super) three_d: bool,
@@ -36,6 +37,7 @@ impl Default for Native {
             snapshot: None,
             error: None,
             paused: false,
+            export_requested: false,
             cells: 40,
             quantity: 0,
             three_d: false,
@@ -158,6 +160,12 @@ impl Native {
                 .clicked()
             {
                 self.paused = !self.paused;
+            }
+            if ui
+                .add_enabled(self.snapshot.is_some(), egui::Button::new("CSV поля"))
+                .clicked()
+            {
+                self.export_requested = true;
             }
             if ui.button("Начать заново").clicked() {
                 self.config = None;
