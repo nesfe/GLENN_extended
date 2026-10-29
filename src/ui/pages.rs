@@ -26,6 +26,23 @@ impl Workbench {
             self.volume_flow.show(ui);
             return;
         }
+        if self.page == 0 {
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.potential_view, false, "Вязкий поток · встроенный");
+                ui.selectable_value(&mut self.potential_view, true, "Панельная оценка");
+            });
+            if !self.potential_view {
+                if self.analysis.state == self.state {
+                    self.native_flow.show(ui, &self.analysis);
+                } else {
+                    self.native_flow.suspend();
+                    ui.spinner();
+                    ui.label("Обновление геометрии…");
+                    ui.ctx().request_repaint();
+                }
+                return;
+            }
+        }
         if self.tunnel.busy {
             ui.colored_label(
                 AMBER,
