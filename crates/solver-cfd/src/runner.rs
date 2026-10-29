@@ -87,6 +87,14 @@ wait "$pid"
                 .command(tool)?;
             c.arg("-case").arg(&case_path);
             c.args(args);
+            // OpenFOAM validates its inherited cwd too. Use the ASCII parent
+            // of our alias, not the user's installation/working directory.
+            c.current_dir(case.parent().ok_or("Нет рабочего каталога решателя")?);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
             return Ok(c);
         };
         cmd.arg(&self.bashrc)

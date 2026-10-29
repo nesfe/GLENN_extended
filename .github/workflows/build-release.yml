@@ -45,10 +45,8 @@ jobs:
             platform: windows-x86_64
           - os: ubuntu-22.04
             platform: linux-x86_64
-          - os: macos-14
-            platform: macos-aarch64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Linux dependencies
@@ -92,7 +90,7 @@ jobs:
           python scripts/bundle_windows.py artifacts/package/runtime/openfoam
           Copy-Item target/release/glenn-extended.exe,target/release/glenn-cfd.exe artifacts/package/
           python scripts/test_bundled_cfd.py artifacts/package/glenn-cfd.exe tests/fixtures/cube.stl
-      - name: Package Windows portable executable
+      - name: Package Windows with CFD
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -101,7 +99,12 @@ jobs:
           Copy-Item README.md,LICENSE artifacts/package/
           Copy-Item -Recurse docs artifacts/package/
           Copy-Item assets/fonts/LICENSE-DejaVu.txt artifacts/package/
-          Compress-Archive -Path artifacts/package/* -DestinationPath "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip"
+          & "C:/Program Files/7-Zip/7z.exe" a -tzip -mx=5 "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip" ./artifacts/package/*
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item -Recurse artifacts/package
+          & "C:/Program Files/7-Zip/7z.exe" x -y "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip" '-oartifacts/Перенесённая программа'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd.exe' tests/fixtures/cube.stl
       - name: Bundle native Linux CFD
         if: runner.os == 'Linux'
         run: |
@@ -119,29 +122,10 @@ jobs:
           cp target/release/glenn-extended target/release/glenn-cfd README.md LICENSE assets/fonts/LICENSE-DejaVu.txt artifacts/package/
           cp -r docs artifacts/package/
           tar -czf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C artifacts/package .
-      - name: Package macOS application
-        if: runner.os == 'macOS'
-        run: |
-          app='artifacts/GLENN Extended.app'
-          bundle_version=${VERSION%%-*}
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-          cp target/release/glenn-extended target/release/glenn-cfd "$app/Contents/MacOS/"
-          cp LICENSE assets/fonts/LICENSE-DejaVu.txt "$app/Contents/Resources/"
-          cat > "$app/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-          <key>CFBundleExecutable</key><string>glenn-extended</string>
-          <key>CFBundleIdentifier</key><string>com.nesfe.glennextended</string>
-          <key>CFBundleName</key><string>GLENN Extended</string>
-          <key>CFBundleVersion</key><string>$bundle_version</string>
-          <key>CFBundleShortVersionString</key><string>$bundle_version</string>
-          <key>NSHighResolutionCapable</key><true/>
-          <key>LSMinimumSystemVersion</key><string>11.0</string>
-          </dict></plist>
-          PLIST
-          codesign --force --deep --sign - "$app"
-          ditto -c -k --sequesterRsrc --keepParent "$app" "artifacts/GLENN-Extended-$VERSION-macos-aarch64.zip"
+          rm -rf artifacts/package
+          mkdir -p 'artifacts/Перенесённая программа'
+          tar -xzf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C 'artifacts/Перенесённая программа'
+          python3 scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd' tests/fixtures/cube.stl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-${{ matrix.platform }}
@@ -161,7 +145,7 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       contents: write
     steps:
@@ -171,6 +155,8 @@ jobs:
           pattern: binaries-*
           path: artifacts/release
           merge-multiple: true
+      - name: Mirror corresponding solver sources
+        run: python3 scripts/release_sources.py artifacts/release
       - name: Publish version after every platform passed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -195,7 +181,7 @@ jobs:
             gh release create "$tag" --target "$GITHUB_SHA" --title "GLENN Extended $tag" --notes-file docs/RELEASE.md --draft
           fi
           cd artifacts/release
-          sha256sum GLENN-Extended-* > SHA256SUMS.txt
+          sha256sum GLENN-Extended-* OpenFOAM-* ThirdParty-* > SHA256SUMS.txt
           gh release upload "$tag" ./* --clobber
           if [[ "$version" == *-* ]]; then
             gh release edit "$tag" --draft=false --prerelease --latest=false

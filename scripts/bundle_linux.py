@@ -18,6 +18,7 @@ source, target = (Path(p).resolve() for p in sys.argv[1:3])
 assert 'api=2412' in (source / 'META-INFO/api-info').read_text()
 target.mkdir(parents=True, exist_ok=False)
 shutil.copytree(source / 'etc', target / 'etc', symlinks=False)
+shutil.copytree(source / 'META-INFO', target / 'META-INFO')
 platform = source / 'platforms/linux64GccDPInt32Opt'
 (target / 'bin').mkdir()
 (target / 'lib').mkdir()
@@ -65,12 +66,21 @@ for path in origins:
     query = subprocess.run(['dpkg-query', '-S', path], capture_output=True, text=True)
     if query.returncode == 0:
         packages.add(query.stdout.split(':', 1)[0])
+package_info = []
+for package in sorted(packages):
+    info = subprocess.run(['dpkg-query', '-W', '-f=${binary:Package} ${Version} ${source:Package} ${source:Version}\n', package],
+                          capture_output=True, text=True)
+    if info.returncode == 0:
+        package_info.append(info.stdout)
+(target / 'dependency-packages.txt').write_text(''.join(package_info), encoding='utf-8')
 for package in packages:
     copyright_file = documentation / package / 'copyright'
     if copyright_file.is_file():
         shutil.copy2(copyright_file, licences / f'{package}.txt')
 if not (licences / f'{source.name}.txt').is_file():
     raise RuntimeError(f'Missing solver licence: {documentation / source.name / "copyright"}')
+for licence in ('GPL-3', 'LGPL-2.1', 'LGPL-3', 'GPL-2'):
+    shutil.copy2(Path('/usr/share/common-licenses') / licence, licences / licence)
 
 manifest = {'schema': 1, 'version': '2412', 'platform': 'linux-x86_64',
             'bin': 'bin', 'libraries': ['lib'],

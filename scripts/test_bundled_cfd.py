@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='glenn-case-Продувка ') as tmp:
         case = Path(tmp) / mode
         result = subprocess.run([str(exe), str(fixture), '--case', str(case), '--mode', mode,
                                  '--speed', '1', '--nu', '0.01', '--iterations', '100', '--time', '0.1'],
-                                env=env, text=True, encoding='utf-8', errors='strict', capture_output=True, timeout=600)
+                                cwd=exe.parent, env=env, text=True, encoding='utf-8', errors='strict', capture_output=True, timeout=600)
         print(result.stdout, result.stderr, flush=True)
         if result.returncode:
             raise RuntimeError(f'Bundled {mode} solver failed: {result.returncode}')
