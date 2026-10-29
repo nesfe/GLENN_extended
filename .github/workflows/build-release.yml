@@ -134,7 +134,7 @@ jobs:
           mkdir -p 'artifacts/Перенесённая программа'
           tar -xzf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C 'artifacts/Перенесённая программа'
           python3 scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd' tests/fixtures/cube.stl
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-${{ matrix.platform }}
           path: |
@@ -142,7 +142,7 @@ jobs:
             artifacts/GLENN-Extended-*.tar.gz
             artifacts/GLENN-Extended-*.exe
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Linux'
         with:
           name: ui-screenshots
