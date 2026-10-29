@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "glenn-extended"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 edition = "2024"
 rust-version = "1.88"
 authors = ["nesfe"]
@@ -13,6 +13,7 @@ description = "Native aerodynamic workbench with a cached Hess–Smith panel sol
 repository = "https://github.com/nesfe/GLENN_extended"
 
 [dependencies]
+glenn-solver-native = { path = "crates/solver-native" }
 glenn-core = { path = "crates/core" }
 glenn-solver-panel = { path = "crates/solver-panel" }
 glenn-io = { path = "crates/io" }
@@ -48,3 +49,7 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"
+
+# The live numerical loop must also run interactively in development builds.
+[profile.dev.package.glenn-solver-native]
+opt-level = 3

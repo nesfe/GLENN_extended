@@ -1289,7 +1289,7 @@ version = "0.1.0"
 
 [[package]]
 name = "glenn-extended"
-version = "4.0.0-beta.1"
+version = "4.0.0-beta.2"
 dependencies = [
  "bytemuck",
  "cpal",
@@ -1299,6 +1299,7 @@ dependencies = [
  "glenn-engine",
  "glenn-io",
  "glenn-solver-cfd",
+ "glenn-solver-native",
  "glenn-solver-panel",
  "image",
  "rfd",
@@ -1328,6 +1329,14 @@ dependencies = [
  "glenn-io",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "glenn-solver-native"
+version = "0.1.0"
+dependencies = [
+ "glenn-core",
 ]
 
 [[package]]

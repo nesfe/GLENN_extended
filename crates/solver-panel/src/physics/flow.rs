@@ -158,9 +158,27 @@ pub struct Streamline {
     pub vortex: bool,
 }
 
+/// A viscous section solution, sampled in place of the panel bases when the
+/// tunnel runs the native solver. Unlike those bases it is not linear in
+/// incidence, so an implementation carries the angle it was computed at and
+/// only answers inside the box it actually solved.
+pub trait SectionField: Sync {
+    /// Section-frame velocity over free-stream speed, or None outside the
+    /// computed box and inside the body.
+    fn sample(&self, point: Point) -> Option<Point>;
+    /// How much of that solution applies here: one well inside the computed
+    /// box, fading to zero at its edge so the surrounding potential field
+    /// joins onto it without a step.
+    fn weight(&self, point: Point) -> f64;
+}
+
 pub struct FlowField<'a> {
     pub analysis: &'a Analysis,
     pub grid: &'a SectionGrid,
+    /// Present when the ordinary tunnel shows the native viscous solver. The
+    /// separated region then comes out of the solved field, so the empirical
+    /// wake below is switched off rather than added on top of it.
+    pub viscous: Option<&'a dyn SectionField>,
 }
 impl FlowField<'_> {
     pub fn spin_ratio(&self) -> f64 {
@@ -216,10 +234,23 @@ impl FlowField<'_> {
         let frame = SectionFrame::at(state, span_position);
         let local = frame.to_section(world);
         let section_velocity = if state.profile_type == crate::model::Profile::Cylinder {
+            // The native solver holds its wall still, so it cannot carry the
+            // Magnus circulation a spinning cylinder needs.
             super::panel::cylinder_velocity(local, frame.incidence, self.spin_ratio())
         } else {
-            self.grid
-                .velocity(&self.analysis.panel, local, frame.incidence)
+            let potential = self
+                .grid
+                .velocity(&self.analysis.panel, local, frame.incidence);
+            match self
+                .viscous
+                .and_then(|v| Some((v.sample(local)?, v.weight(local))))
+            {
+                Some((viscous, weight)) => Point::new(
+                    potential.x + (viscous.x - potential.x) * weight,
+                    potential.y + (viscous.y - potential.y) * weight,
+                ),
+                None => potential,
+            }
         };
         let mut velocity = frame.velocity_to_world(section_velocity);
         // Fade the 2D section's influence beyond the physical wing tips.
@@ -242,10 +273,15 @@ impl FlowField<'_> {
             velocity.y -= factor * dz;
             velocity.z += factor * dy;
         }
-        let wake = self.wake_weight(world);
-        let stall = self.analysis.current.stall_fraction;
-        velocity.x *= 1.0 - 0.6 * stall * wake;
-        velocity.y -= wake * self.analysis.current.cl * 0.035;
+        if self.viscous.is_none() {
+            // Potential flow cannot separate, so the panel view needs this
+            // empirical deficit to look like a stalled wing at all. It is drawn,
+            // not solved: with a viscous section present the real one is there.
+            let wake = self.wake_weight(world);
+            let stall = self.analysis.current.stall_fraction;
+            velocity.x *= 1.0 - 0.6 * stall * wake;
+            velocity.y -= wake * self.analysis.current.cl * 0.035;
+        }
         // The present model predicts a mean deficit, not vortex shedding.
         // Do not manufacture time-dependent eddies absent from the equations.
         velocity
@@ -383,6 +419,31 @@ impl FlowField<'_> {
                     z,
                 );
                 paths.push((seed, false));
+            }
+        }
+        // The injection rake passes too far from the surface to show where the
+        // flow leaves the wing. With a solved viscous plane there is a real
+        // shear layer to follow, so seed that as well.
+        if self.viscous.is_some() {
+            let lanes = span_lanes.min(5);
+            let surface = if self.analysis.current.cl >= 0.0 {
+                &self.analysis.foil.upper
+            } else {
+                &self.analysis.foil.lower
+            };
+            let offset = if self.analysis.current.cl >= 0.0 {
+                0.05
+            } else {
+                -0.05
+            };
+            for lane in 0..lanes {
+                let z = state.span * 0.42 * (2.0 * lane as f64 / (lanes - 1) as f64 - 1.0);
+                let frame = SectionFrame::at(state, z);
+                for station in 0..(5 + density) {
+                    let x = 0.06 + 0.86 * station as f64 / (4 + density) as f64;
+                    let height = interpolate(surface, x) + offset;
+                    paths.push((frame.to_world(Point::new(x, height)), false));
+                }
             }
         }
         if self.tip_circulation().abs() > state.velocity * state.chord * 0.01 {

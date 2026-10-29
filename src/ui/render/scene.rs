@@ -5,6 +5,7 @@ use crate::ui::tunnel::{View, color};
 use glam::{DVec3, Vec3};
 use glenn_extended::{
     geometry::{body_to_world, interpolate},
+    model::Point,
     physics::{aerodynamics::Analysis, flow::Streamline},
 };
 
@@ -13,8 +14,104 @@ pub struct Scene {
     pub solid_count: u32,
     pub lines: Vec<LineInstance>,
 }
+
+/// Does the flow just off the skin run back towards the nose? Measured along
+/// the local surface tangent, not along the chord: air rounding the leading
+/// edge moves backwards in chord coordinates while still firmly attached.
+fn separated(
+    field: &dyn glenn_extended::physics::flow::SectionField,
+    foil: &glenn_extended::geometry::Airfoil,
+    local: Point,
+    upper: bool,
+) -> bool {
+    let line = if upper { &foil.upper } else { &foil.lower };
+    let (ahead, behind) = ((local.x - 0.02).max(0.0), (local.x + 0.02).min(1.0));
+    let tangent = Point::new(
+        behind - ahead,
+        interpolate(line, behind) - interpolate(line, ahead),
+    );
+    let length = tangent.x.hypot(tangent.y);
+    if length < 1e-9 {
+        return false;
+    }
+    let tangent = Point::new(tangent.x / length, tangent.y / length);
+    // Outward normal, flipped for the lower surface.
+    let (nx, ny) = if upper {
+        (-tangent.y, tangent.x)
+    } else {
+        (tangent.y, -tangent.x)
+    };
+    // Real separation has thickness. A single near-wall sample also goes
+    // negative in the one-cell layer the lattice cannot resolve at this
+    // Reynolds number, which would paint an attached section orange.
+    [0.04, 0.08].iter().all(|offset| {
+        let probe = Point::new(local.x + nx * offset, local.y + ny * offset);
+        field
+            .sample(probe)
+            .is_some_and(|u| u.x * tangent.x + u.y * tangent.y < -0.02)
+    })
+}
 impl Scene {
-    pub fn new(analysis: &Analysis, paths: &[Streamline], view: &View) -> Self {
+    /// Root-section viscous field in the actual wing frame. No spanwise
+    /// extension of 2D velocities and no potential-pressure colouring.
+    pub fn native(
+        analysis: &Analysis,
+        field: &glenn_solver_native::Snapshot,
+        quantity: usize,
+    ) -> Self {
+        let mut scene = Self {
+            vertices: Vec::new(),
+            solid_count: 0,
+            lines: Vec::new(),
+        };
+        let state = &analysis.state;
+        for triangle in &analysis.mesh.triangles {
+            let p = triangle.map(|i| {
+                body_to_world(state, DVec3::from_array(analysis.mesh.vertices[i])).as_vec3()
+            });
+            let normal = (p[1] - p[0])
+                .cross(p[2] - p[0])
+                .normalize_or_zero()
+                .to_array();
+            for v in p {
+                scene.vertices.push(Vertex {
+                    position: v.to_array(),
+                    normal,
+                    color: [0.65, 0.75, 0.8, 1.0],
+                    data: [0.0; 4],
+                });
+            }
+        }
+        scene.solid_count = scene.vertices.len() as u32;
+        let chord = state.chord as f32;
+        let h = 2.0 / field.cells_per_chord;
+        for y in (0..field.height - 2).step_by(2) {
+            for x in (0..field.width - 2).step_by(2) {
+                let i = y * field.width + x;
+                if field.solid[i] {
+                    continue;
+                }
+                let point = field.point(x, y);
+                let c =
+                    crate::ui::native::field_color(field, i, quantity).to_normalized_gamma_f32();
+                for [dx, dy] in [[0.0, 0.0], [h, 0.0], [h, h], [0.0, 0.0], [h, h], [0.0, h]] {
+                    scene.vertices.push(Vertex {
+                        position: [(point[0] + dx - 0.25) * chord, (point[1] + dy) * chord, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        color: [c[0], c[1], c[2], 0.85],
+                        data: [2.0; 4],
+                    });
+                }
+            }
+        }
+        scene
+    }
+    pub fn new(
+        analysis: &Analysis,
+        paths: &[Streamline],
+        view: &View,
+        viscous: Option<&dyn glenn_extended::physics::flow::SectionField>,
+    ) -> Self {
         let mut scene = Self {
             vertices: Vec::new(),
             solid_count: 0,
@@ -63,14 +160,24 @@ impl Scene {
             for &i in triangle {
                 let local = contour[i % section_size];
                 let pressure = &pressures[(i / section_size).min(pressures.len() - 1)];
-                let surface = if i % section_size < analysis.foil.upper.len() - 1 {
+                let upper = i % section_size < analysis.foil.upper.len() - 1;
+                let surface = if upper {
                     &pressure.upper
                 } else {
                     &pressure.lower
                 };
                 let cp = interpolate(surface, local.x);
+                // Separated skin is marked on the wing itself: without it the
+                // detachment is only a few hundredths of a chord thick and
+                // disappears at any view that shows the whole wing.
+                let detached =
+                    viscous.is_some_and(|field| separated(field, &analysis.foil, local, upper));
                 let rgb = if i >= positions.len() - 2 {
                     [0.36, 0.46, 0.55, 1.0]
+                } else if detached {
+                    // Crimson: no Cp palette reaches it, so separation never
+                    // reads as just another pressure level.
+                    [0.70, 0.08, 0.20, 1.0]
                 } else if view.pressure {
                     color(cp, view.palette).to_normalized_gamma_f32()
                 } else {
@@ -269,5 +376,45 @@ mod tests {
         assert_eq!(scene.lines[0].start, [1.0, 2.0, 3.0, 2.5]);
         assert_eq!(scene.lines[0].end, [-4.0, 5.0, 6.0, 4.5]);
         assert!(scene.vertices.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod separation_tests {
+    use super::*;
+    use glenn_extended::{model::Simulation, viscous::Section};
+    use glenn_solver_native::{Config, Solver};
+    use std::sync::Arc;
+
+    /// The separated skin must actually reach the wing surface the viewer sees.
+    /// A field that reverses but paints nothing leaves a stalled wing looking
+    /// exactly like an attached one at any view of the whole aircraft.
+    #[test]
+    fn a_stalled_section_marks_the_skin_and_an_attached_one_does_not() {
+        let marked = |alpha: f64| {
+            let state = Simulation {
+                alpha,
+                ..Simulation::default()
+            };
+            let analysis = Analysis::new(state).unwrap();
+            let mut solver =
+                Solver::new(Config::airfoil(&analysis.foil, alpha, 1.0e6, 40)).unwrap();
+            solver.advance(1500).unwrap();
+            let section = Section::new(Arc::new(solver.snapshot()), alpha);
+            let scene = Scene::new(
+                &analysis,
+                &[],
+                &View::default(),
+                Some(&section as &dyn glenn_extended::physics::flow::SectionField),
+            );
+            scene.vertices[..scene.solid_count as usize]
+                .iter()
+                .filter(|v| v.color == [0.70, 0.08, 0.20, 1.0])
+                .count()
+        };
+        let stalled = marked(24.0);
+        let attached = marked(2.0);
+        assert!(stalled > 50, "a stalled wing must show it: {stalled}");
+        assert_eq!(attached, 0, "an attached wing must not: {attached}");
     }
 }
