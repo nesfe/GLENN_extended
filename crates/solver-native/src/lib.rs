@@ -1,6 +1,7 @@
 //! Progressive two-dimensional viscous flow. D2Q9 with regularized collision,
 //! local Smagorinsky stress and stationary halfway bounce-back walls.
 //! No prescribed separation point, circulation, wake, or lift curve.
+mod compressible;
 pub mod worker;
 
 use glenn_core::{geometry::Airfoil, model::Point};
@@ -37,6 +38,9 @@ pub struct Config {
     pub reynolds: f64,
     pub alpha: f64,
     pub contour: Vec<Point>,
+    /// Physical free-stream Mach number; zero selects the low-Mach lattice.
+    pub mach: f64,
+    pub gamma: f64,
 }
 /// The Reynolds number this many cells per chord can honestly carry. The wall
 /// is a staircase of whole cells, so unless the boundary layer is several
@@ -50,6 +54,12 @@ pub fn resolved_reynolds(chord_cells: usize) -> f64 {
 }
 
 impl Config {
+    pub fn with_gas(mut self, mach: f64, gamma: f64) -> Self {
+        self.mach = mach;
+        self.gamma = gamma;
+        self
+    }
+
     /// Reynolds is capped at what the grid resolves; the caller keeps the
     /// flight value for display and must not present this as that flow.
     pub fn airfoil(foil: &Airfoil, alpha: f64, reynolds: f64, chord_cells: usize) -> Self {
@@ -58,6 +68,8 @@ impl Config {
             alpha,
             reynolds: reynolds.min(resolved_reynolds(chord_cells)),
             chord_cells,
+            mach: 0.0,
+            gamma: 1.4,
         }
     }
 }
@@ -139,7 +151,45 @@ impl Snapshot {
     }
 }
 
-pub struct Solver {
+/// Both engines publish velocities in U_inf and pressure as Cp.
+pub enum Solver {
+    Lattice(Lattice),
+    Compressible(compressible::Compressible),
+}
+impl Solver {
+    pub fn new(config: Config) -> Result<Self, String> {
+        if !config.mach.is_finite()
+            || config.mach < 0.0
+            || !config.gamma.is_finite()
+            || !(1.0..=2.0).contains(&config.gamma)
+            || config.gamma == 1.0
+        {
+            return Err("Недопустимые параметры газа".into());
+        }
+        let lattice = Lattice::new(config)?;
+        if lattice.config.mach > 0.3 {
+            Ok(Self::Compressible(compressible::Compressible::new(
+                lattice,
+            )?))
+        } else {
+            Ok(Self::Lattice(lattice))
+        }
+    }
+    pub fn advance(&mut self, count: usize) -> Result<(), String> {
+        match self {
+            Self::Lattice(s) => s.advance(count),
+            Self::Compressible(s) => s.advance(count),
+        }
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        match self {
+            Self::Lattice(s) => s.snapshot(),
+            Self::Compressible(s) => s.snapshot(),
+        }
+    }
+}
+
+pub struct Lattice {
     config: Config,
     width: usize,
     height: usize,
@@ -176,7 +226,7 @@ fn inside(p: [f64; 2], contour: &[[f64; 2]]) -> bool {
     }
     result
 }
-impl Solver {
+impl Lattice {
     pub fn new(config: Config) -> Result<Self, String> {
         if !(24..=96).contains(&config.chord_cells)
             || !config.reynolds.is_finite()
@@ -384,11 +434,13 @@ mod tests {
     }
     #[test]
     fn uniform_flow_preserves_mass_and_velocity() {
-        let mut s = Solver::new(Config {
+        let mut s = Lattice::new(Config {
             chord_cells: 24,
             reynolds: 1000.0,
             alpha: 0.0,
             contour: vec![],
+            mach: 0.0,
+            gamma: 1.4,
         })
         .unwrap();
         s.advance(400).unwrap();
@@ -403,11 +455,13 @@ mod tests {
     }
     #[test]
     fn shear_wave_decays_at_the_prescribed_viscosity() {
-        let mut s = Solver::new(Config {
+        let mut s = Lattice::new(Config {
             chord_cells: 24,
             reynolds: 30.0,
             alpha: 0.0,
             contour: vec![],
+            mach: 0.0,
+            gamma: 1.4,
         })
         .unwrap();
         s.periodic = true;

@@ -314,29 +314,59 @@ impl Workbench {
     /// Whether the native viscous solver feeds what is on screen: the tunnel
     /// streamlines, or the section view itself.
     fn viscous_active(&self) -> bool {
-        self.page == 8 || (self.page == 0 && !self.potential_view)
+        (self.page == 8 || (self.page == 0 && !self.potential_view))
+            && native::Native::unavailable_reason(&self.analysis).is_none()
     }
     fn recalculate(&mut self) {
-        // Re-tracing the scene on every lattice publication would run faster
-        // than the eye follows and keep the worker permanently busy; ten
-        // updates a second already reads as a developing flow.
-        // A headless capture waits for an idle worker, so once the requested
-        // step is reached the field is held still and the tracer can finish.
-        let frozen = self
-            .capture
+        // Consume completed work before submitting anything: submit clears the
+        // output slot. A new fluid frame must not cancel an unfinished trace.
+        if let Some((_, result)) = self.worker.poll() {
+            self.tunnel.busy = false;
+            match result {
+                Ok(snapshot) => {
+                    self.analysis = snapshot.analysis;
+                    self.performance = snapshot.performance;
+                    self.tunnel.grid = snapshot.grid;
+                    self.tunnel.pending_scene = snapshot.scene;
+                    self.tunnel.viscous = snapshot.viscous;
+                }
+                Err(error) => {
+                    self.status = format!("Расчёт остановлен: {error}");
+                    self.import_message = Some(Err(self.status.clone()));
+                    self.state = self.analysis.state.clone();
+                }
+            }
+        }
+        let current = if self.page == 0 && !self.potential_view && self.analysis.state == self.state
+        {
+            self.native_flow.snapshot_for(&self.analysis)
+        } else {
+            None
+        };
+        let changed_input = self
+            .requested
             .as_ref()
-            .is_some_and(|capture| self.native_flow.ready(capture.native_steps));
-        if self.potential_view || self.page != 0 {
+            .is_some_and(|old| old.state != self.state);
+        if current.is_none() || changed_input {
             self.scene_field = None;
-        } else if !frozen
+        }
+        // Freeze only after the actual requested frame has been sent to the
+        // tracer, not when a newer frame merely arrives from the fluid worker.
+        let frozen = self.capture.as_ref().is_some_and(|capture| {
+            self.scene_field
+                .as_ref()
+                .is_some_and(|field| field.step >= capture.native_steps)
+        });
+        if !self.tunnel.busy
+            && !frozen
             && self.scene_tick.elapsed() >= Duration::from_millis(100)
-            && let Some(current) = &self.native_flow.snapshot
+            && let Some(current) = current
             && self
                 .scene_field
                 .as_ref()
-                .is_none_or(|shown| !Arc::ptr_eq(shown, current))
+                .is_none_or(|shown| !Arc::ptr_eq(shown, &current))
         {
-            self.scene_field = Some(current.clone());
+            self.scene_field = Some(current);
             self.scene_tick = std::time::Instant::now();
         }
         let request = jobs::Request {
@@ -353,22 +383,6 @@ impl Workbench {
             self.worker.submit(request.clone());
             self.requested = Some(request);
             self.tunnel.busy = true;
-        }
-        if let Some((_, result)) = self.worker.poll() {
-            self.tunnel.busy = false;
-            match result {
-                Ok(snapshot) => {
-                    self.analysis = snapshot.analysis;
-                    self.performance = snapshot.performance;
-                    self.tunnel.grid = snapshot.grid;
-                    self.tunnel.pending_scene = snapshot.scene;
-                }
-                Err(error) => {
-                    self.status = format!("Расчёт остановлен: {error}");
-                    self.import_message = Some(Err(self.status.clone()));
-                    self.state = self.analysis.state.clone();
-                }
-            }
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
@@ -534,6 +548,9 @@ impl eframe::App for Workbench {
         if !self.viscous_active() {
             self.native_flow.suspend();
         }
+        if self.viscous_active() && !self.native_flow.paused {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
         if self.tunnel.busy || self.importing {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -679,6 +696,109 @@ mod tests {
         assert!(app.import_message.as_ref().unwrap().is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn unsupported_viscous_speed_keeps_the_tunnel_visible_without_input() {
+        fn has_title(shape: &egui::Shape) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains("Аэродинамическая труба"),
+                egui::Shape::Vec(shapes) => shapes.iter().any(has_title),
+                _ => false,
+            }
+        }
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let mut app = Workbench::with_state(Simulation {
+            velocity: 250.0,
+            ..Simulation::default()
+        });
+        assert!(app.analysis.current.mach > 0.3);
+        for _ in 0..4 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1440.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            assert!(
+                output.shapes.iter().any(|shape| has_title(&shape.shape)),
+                "The tunnel vanished while no slider was being moved"
+            );
+        }
+    }
+
+    #[test]
+    fn live_frames_do_not_cancel_a_trace_that_has_not_finished() {
+        use std::sync::mpsc;
+        let mut app = Workbench::with_state(Simulation::default());
+        app.native_flow.advance(&app.analysis).unwrap();
+        app.native_flow.paused = true;
+        app.native_flow.suspend();
+        let re = app.state.velocity * app.state.chord * app.analysis.atmosphere.density
+            / app.analysis.atmosphere.viscosity;
+        let solver = glenn_solver_native::Solver::new(glenn_solver_native::Config::airfoil(
+            &app.analysis.foil,
+            app.state.alpha,
+            re,
+            40,
+        ))
+        .unwrap();
+        let mut field = solver.snapshot();
+        app.native_flow.snapshot = Some(Arc::new(field.clone()));
+        app.scene_tick = std::time::Instant::now() - Duration::from_secs(1);
+        let (started, wait_started) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let analysis = app.analysis.clone();
+        let mut first = true;
+        app.worker = glenn_extended::engine::Worker::new(move |request: jobs::Request, cancel| {
+            if first {
+                first = false;
+                started.send(()).unwrap();
+                wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            cancel.check()?;
+            Ok(jobs::Snapshot {
+                analysis: analysis.clone(),
+                performance: flight::calculate(&analysis),
+                grid: None,
+                scene: None,
+                viscous: request.viscous.is_some(),
+            })
+        });
+        app.recalculate();
+        wait_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let first_frame = app.requested.as_ref().unwrap().viscous.clone().unwrap();
+        for _ in 0..6 {
+            field.step += 24;
+            app.native_flow.snapshot = Some(Arc::new(field.clone()));
+            app.scene_tick = std::time::Instant::now() - Duration::from_secs(1);
+            app.recalculate();
+            assert!(Arc::ptr_eq(
+                app.requested.as_ref().unwrap().viscous.as_ref().unwrap(),
+                &first_frame
+            ));
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.tunnel.viscous {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "No scene completed under a stream of fluid frames"
+            );
+            app.recalculate();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.state.alpha += 2.0;
+        app.recalculate();
+        assert!(
+            app.requested.as_ref().unwrap().viscous.is_none(),
+            "Old-angle field was reused after a slider change"
+        );
+    }
+
     #[test]
     fn panels_fit_without_intersection_at_supported_sizes() {
         for (width, height) in [

@@ -97,6 +97,39 @@ pub(super) fn field_color(f: &Snapshot, i: usize, quantity: usize) -> Color32 {
     )
 }
 impl Native {
+    pub fn unavailable_reason(analysis: &Analysis) -> Option<&'static str> {
+        let state = &analysis.state;
+        if state.velocity <= 0.0 {
+            Some("Скорость потока равна нулю.")
+        } else if analysis.current.mach > 0.3 {
+            Some("Вязкий решатель работает при M ≤ 0,3.")
+        } else if state.profile_type == glenn_extended::model::Profile::Cylinder
+            && state.cylinder_rpm != 0.0
+        {
+            Some("Вязкий решатель поддерживает только неподвижный цилиндр.")
+        } else {
+            None
+        }
+    }
+
+    pub fn snapshot_for(&self, analysis: &Analysis) -> Option<Arc<Snapshot>> {
+        if Self::unavailable_reason(analysis).is_some() || self.error.is_some() {
+            return None;
+        }
+        let state = &analysis.state;
+        let re = state.velocity * state.chord * analysis.atmosphere.density
+            / analysis.atmosphere.viscosity;
+        (self.config.as_ref()
+            == Some(&Config::airfoil(
+                &analysis.foil,
+                state.alpha,
+                re,
+                self.cells,
+            )))
+        .then(|| self.snapshot.clone())
+        .flatten()
+    }
+
     pub fn export_csv(&self, analysis: &Analysis) -> Result<String, String> {
         use std::fmt::Write;
         let field = self.snapshot.as_ref().ok_or("Нет рассчитанного поля")?;
@@ -253,20 +286,7 @@ impl Native {
         let state = &analysis.state;
         let re = state.velocity * state.chord * analysis.atmosphere.density
             / analysis.atmosphere.viscosity;
-        let invalid = if state.velocity <= 0.0 {
-            Some("Задайте ненулевую скорость потока.")
-        } else if analysis.current.mach > 0.3 {
-            Some(
-                "Для этой несжимаемой трубы задайте скорость ниже 0,3 скорости звука. Ударные волны здесь не рассчитываются.",
-            )
-        } else if state.profile_type == glenn_extended::model::Profile::Cylinder
-            && state.cylinder_rpm != 0.0
-        {
-            Some("Для встроенной трубы задайте неподвижный цилиндр (0 об/мин).")
-        } else {
-            None
-        };
-        if let Some(message) = invalid {
+        if let Some(message) = Self::unavailable_reason(analysis) {
             self.suspend();
             self.config = None;
             self.snapshot = None;
@@ -292,7 +312,9 @@ impl Native {
                 Err(e) => self.error = Some(e),
             }
         }
-        Ok(())
+        self.error
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.clone()))
     }
 
     fn draw(
@@ -501,6 +523,32 @@ impl Native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_old_field_cannot_be_used_after_leaving_the_solver_range() {
+        let mut analysis = Analysis::new(glenn_extended::model::Simulation::default()).unwrap();
+        let re = analysis.state.velocity * analysis.state.chord * analysis.atmosphere.density
+            / analysis.atmosphere.viscosity;
+        let config = Config::airfoil(&analysis.foil, analysis.state.alpha, re, 40);
+        let solver = glenn_solver_native::Solver::new(config.clone()).unwrap();
+        let view = Native {
+            config: Some(config),
+            snapshot: Some(Arc::new(solver.snapshot())),
+            ..Native::default()
+        };
+        assert!(view.snapshot_for(&analysis).is_some());
+        let initial = analysis.state.clone();
+        let mut state = initial.clone();
+        state.velocity = 250.0;
+        analysis.update(&state).unwrap();
+        assert!(view.snapshot_for(&analysis).is_none());
+        analysis.update(&initial).unwrap();
+        assert!(view.snapshot_for(&analysis).is_some());
+        state = initial;
+        state.alpha += 5.0;
+        analysis.update(&state).unwrap();
+        assert!(view.snapshot_for(&analysis).is_none());
+    }
+
     #[test]
     fn exported_viscous_field_uses_si_units_and_rejects_changed_geometry() {
         let mut analysis = Analysis::new(glenn_extended::model::Simulation::default()).unwrap();
