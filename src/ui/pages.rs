@@ -53,8 +53,7 @@ impl Workbench {
             if !self.potential_view {
                 if self.analysis.state == self.state {
                     if let Err(message) = self.native_flow.advance(&self.analysis) {
-                        ui.colored_label(AMBER, message);
-                        return;
+                        ui.colored_label(AMBER, format!("Показана панельная оценка. {message}"));
                     }
                 } else {
                     self.native_flow.suspend();
@@ -74,7 +73,7 @@ impl Workbench {
         }
         match self.page {
             0 => {
-                let viscous = !self.potential_view;
+                let viscous = self.tunnel.viscous;
                 tunnel::show(
                     ui,
                     &self.analysis,
@@ -123,7 +122,7 @@ impl Workbench {
             }
             ui.add(
                 egui::Label::new(
-                    RichText::new(if self.viscous_active() {
+                    RichText::new(if self.tunnel.viscous && self.page == 0 {
                         "Силы — панельная оценка крыла; поле и отрыв — вязкий расчёт"
                     } else if r.stall_fraction > 0.4 {
                         "Эмпирическая оценка срыва"
