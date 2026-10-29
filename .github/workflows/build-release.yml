@@ -71,18 +71,23 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: '1'
           WGPU_BACKEND: vulkan
         run: |
-          for page in 0 1 2 3 4 5 6 7; do
-            timeout 30s xvfb-run -a -s '-screen 0 1600x1200x24' target/release/glenn-extended --screenshot "artifacts/screenshots/page-$page.png" --size 800x600 --page "$page"
-            timeout 30s xvfb-run -a -s '-screen 0 1600x1200x24' target/release/glenn-extended --screenshot "artifacts/screenshots/page-$page-bottom.png" --size 800x600 --page "$page" --scroll-end
+          # A few lattice steps are enough for layout; the expressive frames
+          # below run the viscous field out properly.
+          for page in 0 1 2 3 4 5 6 7 8; do
+            timeout 60s xvfb-run -a -s '-screen 0 1600x1200x24' target/release/glenn-extended --screenshot "artifacts/screenshots/page-$page.png" --size 800x600 --page "$page" --native-steps 48
+            timeout 60s xvfb-run -a -s '-screen 0 1600x1200x24' target/release/glenn-extended --screenshot "artifacts/screenshots/page-$page-bottom.png" --size 800x600 --page "$page" --scroll-end --native-steps 48
           done
           timeout 30s xvfb-run -a -s '-screen 0 1920x1080x24' target/release/glenn-extended --screenshot artifacts/screenshots/hidpi.png --size 1280x720 --scale 1.5
           test -s artifacts/screenshots/hidpi.png
-          timeout 60s xvfb-run -a target/release/glenn-extended --screenshot artifacts/screenshots/native-3d.png --size 1440x900 --alpha 24 --native-3d
+          timeout 120s xvfb-run -a target/release/glenn-extended --screenshot artifacts/screenshots/viscous-tunnel.png --size 1440x900 --alpha 24 --native-steps 1500 --camera 1
+          timeout 120s xvfb-run -a target/release/glenn-extended --screenshot artifacts/screenshots/viscous-section.png --size 1440x900 --alpha 24 --native-steps 1200 --page 8
+          timeout 120s xvfb-run -a target/release/glenn-extended --screenshot artifacts/screenshots/native-3d.png --size 1440x900 --alpha 24 --native-steps 1200 --page 8 --native-3d
+          test -s artifacts/screenshots/viscous-tunnel.png
           for input in tests/fixtures/profile.dxf tests/fixtures/cube.stl; do
             timeout 60s xvfb-run -a target/release/glenn-extended --screenshot "artifacts/screenshots/import-$(basename "$input").png" --input "$input" --size 1440x900
           done
           for alpha in -10 0 10 22; do
-            timeout 60s xvfb-run -a -s '-screen 0 1920x1080x24' target/release/glenn-extended --screenshot "artifacts/screenshots/flow-$alpha.png" --size 1440x900 --alpha "$alpha" --camera 1
+            timeout 90s xvfb-run -a -s '-screen 0 1920x1080x24' target/release/glenn-extended --screenshot "artifacts/screenshots/flow-$alpha.png" --size 1440x900 --alpha "$alpha" --camera 1
           done
       - name: Bundle native Windows CFD
         if: runner.os == 'Windows'
