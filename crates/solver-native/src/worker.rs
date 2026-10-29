@@ -32,11 +32,17 @@ impl Default for Worker {
                 if c.stop {
                     break;
                 }
-                if generation != c.generation {
+                let requested = if generation != c.generation {
                     generation = c.generation;
-                    solver = Some(Solver::new(c.config.clone().unwrap()));
-                }
+                    c.config.clone()
+                } else {
+                    None
+                };
                 drop(c);
+                // Rasterizing the body must never hold the UI command lock.
+                if let Some(config) = requested {
+                    solver = Some(Solver::new(config));
+                }
                 let result = match solver.as_mut().unwrap() {
                     Ok(s) => s.advance(24).map(|()| Arc::new(s.snapshot())),
                     Err(e) => Err(e.clone()),
