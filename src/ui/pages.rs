@@ -26,24 +26,39 @@ impl Workbench {
             self.volume_flow.show(ui);
             return;
         }
+        if self.page == 8 {
+            if self.analysis.state == self.state {
+                self.native_flow.show(ui, &self.analysis);
+                if std::mem::take(&mut self.native_flow.export_requested) {
+                    self.export("csv");
+                }
+            } else {
+                self.native_flow.suspend();
+                ui.spinner();
+                ui.label("Обновление геометрии…");
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
         if self.page == 0 {
             ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.potential_view, false, "Вязкий поток · встроенный");
+                ui.selectable_value(&mut self.potential_view, false, "Вязкий расчёт · отрыв");
                 ui.selectable_value(&mut self.potential_view, true, "Панельная оценка");
+                if !self.potential_view {
+                    self.native_flow.controls(ui);
+                }
             });
+            // The streamlines drawn below are traced through this solver's
+            // plane, so it has to keep running while the tunnel is open.
             if !self.potential_view {
                 if self.analysis.state == self.state {
-                    self.native_flow.show(ui, &self.analysis);
-                    if std::mem::take(&mut self.native_flow.export_requested) {
-                        self.export("csv");
+                    if let Err(message) = self.native_flow.advance(&self.analysis) {
+                        ui.colored_label(AMBER, message);
+                        return;
                     }
                 } else {
                     self.native_flow.suspend();
-                    ui.spinner();
-                    ui.label("Обновление геометрии…");
-                    ui.ctx().request_repaint();
                 }
-                return;
             }
         }
         if self.tunnel.busy {
@@ -59,7 +74,14 @@ impl Workbench {
         }
         match self.page {
             0 => {
-                tunnel::show(ui, &self.analysis, &mut self.view, &mut self.tunnel);
+                let viscous = !self.potential_view;
+                tunnel::show(
+                    ui,
+                    &self.analysis,
+                    &mut self.view,
+                    &mut self.tunnel,
+                    viscous,
+                );
                 if self.view.probe {
                     self.probe_ui(ui);
                 }
@@ -101,14 +123,22 @@ impl Workbench {
             }
             ui.add(
                 egui::Label::new(
-                    RichText::new(if r.stall_fraction > 0.4 {
+                    RichText::new(if self.viscous_active() {
+                        "Силы — панельная оценка крыла; поле и отрыв — вязкий расчёт"
+                    } else if r.stall_fraction > 0.4 {
                         "Эмпирическая оценка срыва"
                     } else if r.stall_fraction > 0.12 {
                         "Предсрывной режим"
                     } else {
                         "Панельный режим"
                     })
-                    .color(if r.stall_fraction > 0.12 { AMBER } else { CYAN }),
+                    .color(
+                        if !self.viscous_active() && r.stall_fraction > 0.12 {
+                            AMBER
+                        } else {
+                            CYAN
+                        },
+                    ),
                 )
                 .wrap_mode(egui::TextWrapMode::Extend),
             );
@@ -286,6 +316,7 @@ impl Workbench {
         let field = glenn_extended::physics::flow::FlowField {
             analysis: &self.analysis,
             grid,
+            viscous: None,
         };
         let Some(probe) = probe::sample(&field, self.view.probe_position) else {
             ui.colored_label(AMBER, "Зонд внутри крыла: измерение потока недоступно.");

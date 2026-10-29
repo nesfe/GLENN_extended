@@ -51,6 +51,7 @@ fn main() {
             let paths = FlowField {
                 analysis: &analysis,
                 grid: &grid,
+                viscous: None,
             }
             .streamlines(density);
             lines = paths.len();
