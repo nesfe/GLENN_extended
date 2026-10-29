@@ -692,8 +692,10 @@ mod tests {
             let ctx = egui::Context::default();
             style(&ctx);
             let mut app = Workbench::with_state(Simulation::default());
-            for scenario in 0..12 {
-                let page = if scenario == 11 {
+            for scenario in 0..13 {
+                let page = if scenario == 12 {
+                    8
+                } else if scenario == 11 {
                     7
                 } else if scenario == 10 {
                     0
