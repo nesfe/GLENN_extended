@@ -2,6 +2,7 @@
 //! become unreachable. Narrow windows put controls on a dedicated page.
 mod controls;
 mod jobs;
+mod native;
 mod pages;
 mod plots;
 mod render;
@@ -76,6 +77,8 @@ pub struct Workbench {
     view: tunnel::View,
     tunnel: tunnel::Tunnel,
     volume_flow: volume::Volume,
+    native_flow: native::Native,
+    potential_view: bool,
     page: usize,
     control_tab: usize,
     preset: usize,
@@ -163,6 +166,10 @@ impl Workbench {
             .wgpu_render_state
             .clone()
             .map(render::Renderer::new);
+        app.native_flow.renderer = creation
+            .wgpu_render_state
+            .clone()
+            .map(render::Renderer::new);
         app.volume_flow.renderer = creation
             .wgpu_render_state
             .clone()
@@ -205,6 +212,8 @@ impl Workbench {
             view: tunnel::View::default(),
             tunnel: tunnel::Tunnel::default(),
             volume_flow: volume::Volume::default(),
+            native_flow: native::Native::default(),
+            potential_view: false,
             page: 0,
             control_tab: 0,
             preset: 0,
@@ -267,6 +276,9 @@ impl Workbench {
         let data = match extension {
             "json" => interchange::save_project(&self.state),
             "dat" => Ok(interchange::export_dat(&self.analysis)),
+            "csv" if self.page == 0 && !self.potential_view => {
+                self.native_flow.export_csv(&self.analysis)
+            }
             "csv" => Ok(interchange::export_csv(&self.analysis)),
             "obj" => Ok(interchange::export_obj(&self.analysis.mesh)),
             "stl" => Ok(interchange::export_stl(&self.analysis.mesh)),
@@ -292,7 +304,7 @@ impl Workbench {
         let request = jobs::Request {
             state: self.state.clone(),
             view: self.view.clone(),
-            scene: self.tunnel.renderer.is_some(),
+            scene: self.potential_view && self.page == 0 && self.tunnel.renderer.is_some(),
         };
         if self
             .requested
@@ -480,6 +492,9 @@ impl eframe::App for Workbench {
         self.poll_import();
         self.volume_flow.poll(ctx);
         self.draw(ctx);
+        if self.page != 0 || self.potential_view {
+            self.native_flow.suspend();
+        }
         if self.tunnel.busy || self.importing {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -524,6 +539,7 @@ impl eframe::App for Workbench {
                 && !self.tunnel.busy
                 && !self.importing
                 && !self.volume_flow.pending()
+                && (self.page != 0 || self.potential_view || self.native_flow.ready())
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }

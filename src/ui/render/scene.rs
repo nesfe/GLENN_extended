@@ -14,6 +14,60 @@ pub struct Scene {
     pub lines: Vec<LineInstance>,
 }
 impl Scene {
+    /// Root-section viscous field in the actual wing frame. No spanwise
+    /// extension of 2D velocities and no potential-pressure colouring.
+    pub fn native(
+        analysis: &Analysis,
+        field: &glenn_solver_native::Snapshot,
+        quantity: usize,
+    ) -> Self {
+        let mut scene = Self {
+            vertices: Vec::new(),
+            solid_count: 0,
+            lines: Vec::new(),
+        };
+        let state = &analysis.state;
+        for triangle in &analysis.mesh.triangles {
+            let p = triangle.map(|i| {
+                body_to_world(state, DVec3::from_array(analysis.mesh.vertices[i])).as_vec3()
+            });
+            let normal = (p[1] - p[0])
+                .cross(p[2] - p[0])
+                .normalize_or_zero()
+                .to_array();
+            for v in p {
+                scene.vertices.push(Vertex {
+                    position: v.to_array(),
+                    normal,
+                    color: [0.65, 0.75, 0.8, 1.0],
+                    data: [0.0; 4],
+                });
+            }
+        }
+        scene.solid_count = scene.vertices.len() as u32;
+        let chord = state.chord as f32;
+        let h = 2.0 / field.cells_per_chord;
+        for y in (0..field.height - 2).step_by(2) {
+            for x in (0..field.width - 2).step_by(2) {
+                let i = y * field.width + x;
+                if field.solid[i] {
+                    continue;
+                }
+                let point = field.point(x, y);
+                let c =
+                    crate::ui::native::field_color(field, i, quantity).to_normalized_gamma_f32();
+                for [dx, dy] in [[0.0, 0.0], [h, 0.0], [h, h], [0.0, 0.0], [h, h], [0.0, h]] {
+                    scene.vertices.push(Vertex {
+                        position: [(point[0] + dx - 0.25) * chord, (point[1] + dy) * chord, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        color: [c[0], c[1], c[2], 0.85],
+                        data: [2.0; 4],
+                    });
+                }
+            }
+        }
+        scene
+    }
     pub fn new(analysis: &Analysis, paths: &[Streamline], view: &View) -> Self {
         let mut scene = Self {
             vertices: Vec::new(),

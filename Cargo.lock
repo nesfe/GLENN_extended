@@ -1299,6 +1299,7 @@ dependencies = [
  "glenn-engine",
  "glenn-io",
  "glenn-solver-cfd",
+ "glenn-solver-native",
  "glenn-solver-panel",
  "image",
  "rfd",
@@ -1329,6 +1330,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "glenn-solver-native"
+version = "0.1.0"
+dependencies = [
+ "glenn-core",
 ]
 
 [[package]]
