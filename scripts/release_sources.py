@@ -16,17 +16,39 @@ SOURCES = {
         'a55f7f1401e227bf59fbfa318924e73db4069d61b937639d6031f23f58de7575'),
 }
 
-destination = Path(sys.argv[1])
-destination.mkdir(parents=True, exist_ok=True)
-for name, (url, checksum) in SOURCES.items():
-    target = destination / name
-    if not target.is_file():
-        subprocess.run(['curl', '-fsSL', '--retry', '3', '--max-time', '600',
-                        url, '-o', str(target)], check=True)
+def sha256(path):
     digest = hashlib.sha256()
-    with target.open('rb') as stream:
+    with path.open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
-    if digest.hexdigest() != checksum:
-        raise RuntimeError(f'Upstream source checksum mismatch: {name}')
-    print(f'{name}: SHA-256 verified', flush=True)
+    return digest.hexdigest()
+
+
+def download(target, url, checksum):
+    partial = target.with_name(target.name + '.part')
+    if not target.is_file():
+        # curl --retry restarts a timed-out download from the beginning. Keep
+        # the partial archive and issue a fresh Range request on each attempt.
+        for attempt in range(3):
+            print(f'{target.name}: download attempt {attempt + 1}/3', flush=True)
+            result = subprocess.run([
+                'curl', '-fsSL', '--connect-timeout', '30', '--max-time', '600',
+                '--continue-at', '-', url, '-o', str(partial)])
+            if result.returncode == 0:
+                break
+        else:
+            result.check_returncode()
+        if sha256(partial) != checksum:
+            partial.unlink()
+            raise RuntimeError(f'Upstream source checksum mismatch: {target.name}')
+        partial.replace(target)
+    elif sha256(target) != checksum:
+        raise RuntimeError(f'Upstream source checksum mismatch: {target.name}')
+    print(f'{target.name}: SHA-256 verified', flush=True)
+
+
+if __name__ == '__main__':
+    destination = Path(sys.argv[1])
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, (url, checksum) in SOURCES.items():
+        download(destination / name, url, checksum)
