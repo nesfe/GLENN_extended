@@ -265,18 +265,15 @@ impl Native {
                     ui.selectable_value(&mut self.cells, n, format!("{n} ячеек / хорду"));
                 }
             });
-        if let Some(f) = &self.snapshot {
-            // Section coefficients from momentum exchange on the skin: they
-            // belong to this plane, not to the finite wing the cards above show.
-            ui.small(format!(
-                "сечение: cℓ = {:.2} · cd = {:.2} · Re расчёта {:.0} · tU/c = {:.2} · min Ux/U∞ = {:.2}",
-                f.lift,
-                f.drag,
-                self.config.as_ref().map_or(0.0, |c| c.reynolds),
-                f.time,
-                f.min_ux
-            ));
-        }
+    }
+
+    pub fn summary(&self, ui: &mut egui::Ui) {
+        let text = self.snapshot.as_ref().map_or_else(|| "Подготовка поля сечения…".to_string(), |f| format!(
+            "Сечение: cℓ = {:.2} · cd = {:.2} · Re расчёта {:.0} · tU/c = {:.2} · min Ux/U∞ = {:.2}",
+            f.lift, f.drag, self.config.as_ref().map_or(0.0, |c| c.reynolds), f.time, f.min_ux
+        ));
+        ui.add(egui::Label::new(egui::RichText::new(&text).small()).truncate())
+            .on_hover_text(text);
     }
 
     /// Keep the solver fed and collect its latest field. Separate from drawing

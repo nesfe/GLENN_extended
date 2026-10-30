@@ -554,7 +554,11 @@ impl eframe::App for Workbench {
         if self.tunnel.busy || self.importing {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
-        if let Some(message) = &self.import_message {
+        if let Some(message) = self
+            .import_message
+            .as_ref()
+            .filter(|message| message.is_err())
+        {
             let mut dismiss = false;
             egui::Window::new(if message.is_ok() {
                 "Импорт завершён"
@@ -694,6 +698,13 @@ mod tests {
         wait(&mut app);
         assert_eq!(app.page, 7);
         assert!(app.import_message.as_ref().unwrap().is_ok());
+        app.load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ЦАГИ 846-14 (без прорезей).STL"),
+        );
+        wait(&mut app);
+        assert_eq!(app.page, 7);
+        assert!(app.import_message.as_ref().unwrap().is_ok());
+        assert!(app.status.contains("ЦАГИ 846-14"));
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -797,6 +808,59 @@ mod tests {
             app.requested.as_ref().unwrap().viscous.is_none(),
             "Old-angle field was reused after a slider change"
         );
+    }
+
+    #[test]
+    fn tunnel_viewport_does_not_jump_when_background_status_changes() {
+        for width in [640.0, 800.0, 1440.0] {
+            let ctx = egui::Context::default();
+            style(&ctx);
+            let mut app = Workbench::with_state(Simulation::default());
+            app.native_flow.advance(&app.analysis).unwrap();
+            app.native_flow.paused = true;
+            app.native_flow.suspend();
+            let re = app.state.velocity * app.state.chord * app.analysis.atmosphere.density
+                / app.analysis.atmosphere.viscosity;
+            let solver = glenn_solver_native::Solver::new(glenn_solver_native::Config::airfoil(
+                &app.analysis.foil,
+                app.state.alpha,
+                re,
+                40,
+            ))
+            .unwrap();
+            let mut field = solver.snapshot();
+            let mut baseline = None;
+            for frame in 0..8 {
+                app.tunnel.busy = frame % 2 == 1;
+                app.tunnel.viscous = frame >= 2;
+                if frame >= 2 {
+                    field.lift = if frame % 2 == 0 { -123.456 } else { 0.1 };
+                    field.time += 1000.0;
+                    app.native_flow.snapshot = Some(Arc::new(field.clone()));
+                }
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(width, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.active_page(ui));
+                    },
+                );
+                let rect = app.tunnel.viewport.expect("3D viewport must be present");
+                if let Some(initial) = baseline {
+                    assert_eq!(
+                        rect, initial,
+                        "viewport moved at width {width}, frame {frame}"
+                    );
+                } else {
+                    baseline = Some(rect);
+                }
+            }
+        }
     }
 
     #[test]

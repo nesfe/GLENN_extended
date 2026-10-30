@@ -135,11 +135,22 @@ mergePatchPairs ();
                 cells.x, cells.y, cells.z
             ),
     )?;
-    let refinement = match cfg.resolution {
-        Resolution::Preview => 1,
-        Resolution::Standard => 2,
-        Resolution::Fine => 3,
+    // A span-based level erased thin wings entirely: no cell centre remained
+    // inside them. Resolve the solid's volume/area thickness, independently of
+    // its span, before retaining the outside connected region.
+    let thickness =
+        (2.0 * report.volume / report.area).min((report.max - report.min).min_element());
+    let across = match cfg.resolution {
+        Resolution::Preview => 2.0,
+        Resolution::Standard => 3.0,
+        Resolution::Fine => 4.0,
     };
+    let target = (thickness / across).min(l / (16.0 * across));
+    let base_cell = ((hi - lo) / cells.as_dvec3()).max_element();
+    let refinement = (base_cell / target).log2().ceil().max(1.0) as u32;
+    if refinement > 10 {
+        return Err("Геометрия слишком тонкая для автоматической сетки: требуется специальная настройка сетки".into());
+    }
     let layers = if cfg.resolution == Resolution::Preview {
         0
     } else {
@@ -175,7 +186,7 @@ addLayersControls {{
  nBufferCellsNoExtrude 0; nLayerIter 30;
 }}
 meshQualityControls {{
- maxNonOrtho 65; maxBoundarySkewness 20; maxInternalSkewness 4;
+ maxNonOrtho 65; maxBoundarySkewness 3.5; maxInternalSkewness 3.5;
  maxConcave 80; minVol 1e-30; minTetQuality 1e-15;
  minArea -1; minTwist 0.02; minDeterminant 0.001;
  minFaceWeight 0.02; minVolRatio 0.01; minTriangleTwist -1;
@@ -339,9 +350,22 @@ relaxationFactors { fields { p 0.3; } equations { U 0.7; k 0.7; omega 0.7; } }
     )?;
     // Sample a regular cloud for a shared 3D interpolator and slice display.
     // Fluid cells outside mesh and inside solids remain explicitly missing.
-    let sample_lo = report.min - DVec3::splat(l);
-    let sample_hi = report.max + DVec3::new(4.0, 1.0, 1.0) * l;
-    let dims = [49usize, 25, 25];
+    // Resolve the model neighbourhood, not an enormous span-sized empty box.
+    // This cloud is for display only; it does not alter finite-volume cells.
+    let chord = (report.max.x - report.min.x).max(thickness);
+    let padding = DVec3::new(0.5 * chord, 0.3 * chord, 0.15 * chord);
+    let sample_lo = report.min - padding;
+    let sample_hi = report.max + DVec3::new(1.5 * chord, padding.y, padding.z);
+    let dims = match cfg.resolution {
+        Resolution::Preview => [121usize, 65, 49],
+        Resolution::Standard => [161, 81, 65],
+        Resolution::Fine => [201, 97, 81],
+    };
+    write(
+        dir,
+        "body-bounds.json",
+        serde_json::to_string(&(report.min.to_array(), report.max.to_array())).unwrap(),
+    )?;
     let mut locations = String::new();
     for z in 0..dims[2] {
         for y in 0..dims[1] {

@@ -80,14 +80,26 @@ impl VolumeField {
     }
     /// Instantaneous streamlines, not particle trajectories through time.
     pub fn streamlines(&self) -> Vec<Vec<DVec3>> {
+        self.streamlines_around(None)
+    }
+    pub fn streamlines_around(&self, body: Option<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         let step = (self.max - self.min).min_element() / 180.0;
         let mut seeds = Vec::new();
-        for z in 1..8 {
-            for y in 1..12 {
-                seeds.push(
-                    self.min
-                        + (self.max - self.min) * DVec3::new(0.01, y as f64 / 12.0, z as f64 / 8.0),
+        let (lo, hi) = body.unwrap_or((self.min, self.max));
+        // Concentrate the inlet rake on the body's silhouette. Uniform seeds
+        // over the farfield passed metres above/below thin wings.
+        let extent = hi - lo;
+        let pad_y = (extent.y * 0.25).max(extent.x * 0.08);
+        for z in 0..9 {
+            for y in 0..21 {
+                let seed = DVec3::new(
+                    self.min.x + (self.max.x - self.min.x) * 0.02,
+                    (lo.y - pad_y + (extent.y + 2.0 * pad_y) * y as f64 / 20.0)
+                        .clamp(self.min.y + step, self.max.y - step),
+                    (lo.z + extent.z * (z as f64 + 0.5) / 9.0)
+                        .clamp(self.min.z + step, self.max.z - step),
                 );
+                seeds.push(seed);
             }
         }
         // Inlet-only seeds cannot enter a closed recirculation bubble. Seed

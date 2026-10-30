@@ -8,6 +8,13 @@ impl Workbench {
             return;
         }
         if self.page == 7 {
+            if ui.button("Открыть STL…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("STL модель", &["stl", "STL"])
+                    .pick_file()
+            {
+                self.load(path);
+            }
             if ui.button("Передать текущее крыло в CFD").clicked() {
                 let faces = self
                     .analysis
@@ -48,19 +55,24 @@ impl Workbench {
                     self.native_flow.controls(ui);
                 }
             });
+            if !self.potential_view {
+                self.native_flow.summary(ui);
+            }
+            let mut flow_status = String::new();
             // The streamlines drawn below are traced through this solver's
             // plane, so it has to keep running while the tunnel is open.
             if !self.potential_view {
                 if self.analysis.state == self.state {
                     if let Err(message) = self.native_flow.advance(&self.analysis) {
-                        ui.colored_label(AMBER, format!("Показана панельная оценка. {message}"));
+                        flow_status = format!("Показана панельная оценка. {message}");
                     }
                 } else {
                     self.native_flow.suspend();
                 }
             }
+            ui.add(egui::Label::new(RichText::new(flow_status).color(AMBER)).truncate());
         }
-        if self.tunnel.busy {
+        if self.tunnel.busy && self.page != 0 {
             ui.colored_label(
                 AMBER,
                 "Пересчёт: показаны данные последнего завершённого запроса.",
@@ -120,29 +132,18 @@ impl Workbench {
                     },
                 );
             }
-            ui.add(
-                egui::Label::new(
-                    RichText::new(if self.tunnel.viscous && self.page == 0 {
-                        "Силы — панельная оценка крыла; поле и отрыв — вязкий расчёт"
-                    } else if r.stall_fraction > 0.4 {
-                        "Эмпирическая оценка срыва"
-                    } else if r.stall_fraction > 0.12 {
-                        "Предсрывной режим"
-                    } else {
-                        "Панельный режим"
-                    })
-                    .color(
-                        if !self.viscous_active() && r.stall_fraction > 0.12 {
-                            AMBER
-                        } else {
-                            CYAN
-                        },
-                    ),
-                )
-                .wrap_mode(egui::TextWrapMode::Extend),
-            );
         });
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Силы и L/D: панельная оценка крыла. Расчёт сечения показан отдельно.",
+                )
+                .color(MUTED),
+            )
+            .truncate(),
+        );
     }
+
     pub(super) fn charts(&self, ui: &mut egui::Ui) {
         ui.heading("Аэродинамические характеристики");
         ui.label("Поляра: −30…45° · одна геометрия, среда и скорость · точка — текущий режим");
