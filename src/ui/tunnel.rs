@@ -137,7 +137,10 @@ pub struct Tunnel {
     pub renderer: Option<super::render::Renderer>,
     pub grid: Option<std::sync::Arc<glenn_extended::physics::flow::SectionGrid>>,
     pub pending_scene: Option<super::render::Scene>,
+    pub viscous: bool,
     pub busy: bool,
+    #[cfg(test)]
+    pub viewport: Option<egui::Rect>,
     clock: f64,
     last_time: Option<f64>,
 }
@@ -177,22 +180,22 @@ pub fn show(
         .small()
         .color(MUTED),
     );
-    if tunnel.busy {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Пересчёт… Показан последний завершённый результат.");
-        });
-    }
-    if analysis.current.mach > 0.75 {
-        ui.colored_label(AMBER, "За пределами применимости: эти линии не показывают ударные волны и вязкий отрыв. Объёмный несжимаемый CFD также не подходит для этого числа Маха.");
+    let message = if analysis.current.mach > 0.75 {
+        "Этот режим не рассчитывает ударные волны."
     } else if viscous {
-        ui.colored_label(CYAN, "Линии прослежены через вязкий расчёт сечения; малиновым на крыле — оторванная обшивка. Поле решено для корневого сечения и применено по размаху, поэтому крутка в нём не учитывается.");
-    } else if analysis.current.stall_fraction > 0.12 {
-        ui.colored_label(AMBER, "Панельный режим: отрыв не решается, след нарисован по эмпирической оценке. Вязкий отрыв — на вкладках «Вязкий расчёт» и «Объёмная CFD».");
-    }
+        "Поле корневого сечения применяется по размаху; малиновым — область обратного течения."
+    } else {
+        "Панельное поле: вязкий отрыв не рассчитывается."
+    };
+    ui.add(egui::Label::new(egui::RichText::new(message).color(MUTED)).truncate())
+        .on_hover_text(message);
     let height = (ui.available_height() - 110.0).clamp(280.0, 620.0);
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::drag());
+    #[cfg(test)]
+    {
+        tunnel.viewport = Some(rect);
+    }
     if response.dragged() {
         let delta = ui.input(|i| i.pointer.delta());
         view.yaw += delta.x as f64 * 0.008;
@@ -214,6 +217,15 @@ pub fn show(
     }
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 10, Color32::from_rgb(9, 17, 27));
+    if tunnel.busy {
+        painter.text(
+            rect.left_top() + Vec2::splat(10.0),
+            egui::Align2::LEFT_TOP,
+            "Обновление поля…",
+            egui::FontId::proportional(12.0),
+            AMBER,
+        );
+    }
     let state = &analysis.state;
     let aero = &analysis.current;
     let mesh = &analysis.mesh;

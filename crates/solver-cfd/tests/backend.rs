@@ -66,6 +66,12 @@ fn imported_pressure_has_physical_units_and_fields_cannot_mix_times() {
     ));
     std::fs::create_dir_all(root.join("postProcessing/sample/10")).unwrap();
     std::fs::create_dir_all(root.join("postProcessing/loads/0")).unwrap();
+    std::fs::create_dir_all(root.join("constant/polyMesh")).unwrap();
+    std::fs::write(
+        root.join("constant/polyMesh/boundary"),
+        "1\n(\nbody\n{\nnFaces 6;\n}\n)\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("glenn-case.json"),
         serde_json::to_string(&Config {
@@ -107,4 +113,42 @@ fn imported_pressure_has_physical_units_and_fields_cannot_mix_times() {
     std::fs::write(&field, cloud.replacen("3 1", "broken 1", 1)).unwrap();
     assert!(glenn_solver_cfd::load_result(&root).is_err());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn uploaded_tsagi_is_imported_and_its_thickness_controls_refinement() {
+    let model =
+        glenn_io::stl::parse(include_bytes!("../../../ЦАГИ 846-14 (без прорезей).STL")).unwrap();
+    assert_eq!(model.triangles.len(), 9408);
+    let (lo, hi) = model.bounds();
+    assert!(((hi - lo).z - 35.0).abs() < 1e-6);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("ЦАГИ расчёт");
+    write_case(&path, &model, &Config::default()).unwrap();
+    let snappy = std::fs::read_to_string(path.join("system/snappyHexMeshDict")).unwrap();
+    assert!(
+        snappy.contains("level (7 7)"),
+        "thin wing must not disappear in span-sized cells"
+    );
+    let (dims, a, b): ([usize; 3], [f64; 3], [f64; 3]) =
+        serde_json::from_str(&std::fs::read_to_string(path.join("sample-grid.json")).unwrap())
+            .unwrap();
+    assert!(
+        (b[1] - a[1]) / ((dims[1] - 1) as f64) < 0.2,
+        "display grid must sample near the wing"
+    );
+}
+
+#[test]
+fn a_previously_saved_empty_tunnel_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("constant/polyMesh")).unwrap();
+    for text in [
+        "inlet\n{\nnFaces 400;\n}\n",
+        "body\n{\nnFaces 0;\n}\nother\n{\nnFaces 100;\n}\n",
+    ] {
+        std::fs::write(root.path().join("constant/polyMesh/boundary"), text).unwrap();
+        let error = glenn_solver_cfd::load_result(root.path()).err().unwrap();
+        assert!(error.contains("body: 0 граней"), "{error}");
+    }
 }

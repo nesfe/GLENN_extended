@@ -48,6 +48,7 @@ pub struct Snapshot {
     pub performance: Performance,
     pub grid: Option<Arc<SectionGrid>>,
     pub scene: Option<Scene>,
+    pub viscous: bool,
 }
 pub fn worker(initial: Analysis) -> Worker<Request, Snapshot> {
     let mut analysis = initial;
@@ -107,6 +108,7 @@ pub fn worker(initial: Analysis) -> Worker<Request, Snapshot> {
             performance,
             grid: grid.clone(),
             scene,
+            viscous: request.viscous.is_some(),
         })
     })
 }

@@ -211,6 +211,29 @@ fn stage(
     }
     Ok(())
 }
+/// A valid fluid mesh can be an empty tunnel: checkMesh alone cannot prove
+/// that snappyHexMesh retained the imported solid.
+pub fn body_faces(case: &Path) -> Result<usize, String> {
+    let path = case.join("constant/polyMesh/boundary");
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::trim);
+    let count = if lines.any(|line| line == "body") {
+        lines
+            .take_while(|line| !line.starts_with('}'))
+            .find_map(|line| {
+                line.strip_prefix("nFaces")
+                    .and_then(|v| v.trim().trim_end_matches(';').parse::<usize>().ok())
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if count == 0 {
+        return Err("Сетка не содержит поверхность модели (body: 0 граней). Продувка пустой трубы отменена. Увеличьте разрешение сетки.".into());
+    }
+    Ok(count)
+}
+
 pub fn run(
     mesh: &SolidMesh,
     cfg: &Config,
@@ -240,6 +263,7 @@ pub fn run(
         token,
         progress,
     )?;
+    body_faces(case)?;
     stage(backend, case, "checkMesh", &[], token, progress)?;
     let mesh_log = fs::read_to_string(case.join("log.checkMesh")).map_err(|e| e.to_string())?;
     if !mesh_log.contains("Mesh OK") {
@@ -283,6 +307,7 @@ pub fn run(
 
 /// Reopen a completed case without rerunning or mixing it with current inputs.
 pub fn load_result(case: &Path) -> Result<RunResult, String> {
+    body_faces(case)?;
     let cfg: Config = serde_json::from_str(
         &fs::read_to_string(case.join("glenn-case.json")).map_err(|e| e.to_string())?,
     )
@@ -300,7 +325,16 @@ pub fn load_result(case: &Path) -> Result<RunResult, String> {
     }
     let log = fs::read_to_string(case.join(format!("log.{solver}"))).map_err(|e| e.to_string())?;
     let converged = log.contains("SIMPLE solution converged");
-    let streamlines = field.streamlines();
+    let bounds = if case.join("body-bounds.json").is_file() {
+        let (lo, hi): ([f64; 3], [f64; 3]) = serde_json::from_str(
+            &fs::read_to_string(case.join("body-bounds.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        Some((DVec3::from_array(lo), DVec3::from_array(hi)))
+    } else {
+        None
+    };
+    let streamlines = field.streamlines_around(bounds);
     Ok(RunResult {
         field,
         force,
