@@ -7,7 +7,7 @@ authors = ["nesfe"]
 
 [dependencies]
 glenn-core = { path = "../core" }
-glam = "0.30"
+glam = "0.34"
 
 [lints.rust]
 unsafe_code = "forbid"
