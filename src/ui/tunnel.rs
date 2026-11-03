@@ -137,6 +137,7 @@ pub struct Tunnel {
     pub renderer: Option<super::render::Renderer>,
     pub grid: Option<std::sync::Arc<glenn_extended::physics::flow::SectionGrid>>,
     pub pending_scene: Option<super::render::Scene>,
+    pub viscous: bool,
     pub busy: bool,
     clock: f64,
     last_time: Option<f64>,

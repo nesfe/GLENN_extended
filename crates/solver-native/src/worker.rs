@@ -109,6 +109,8 @@ mod tests {
             reynolds: 100.0,
             alpha: 0.0,
             contour: vec![],
+            mach: 0.0,
+            gamma: 1.4,
         };
         worker.submit(config.clone());
         config.alpha = 30.0;
