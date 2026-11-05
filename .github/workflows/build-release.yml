@@ -48,7 +48,7 @@ jobs:
           - os: ubuntu-22.04
             platform: linux-x86_64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Linux dependencies
@@ -106,6 +106,8 @@ jobs:
           Copy-Item target/release/glenn-extended.exe,target/release/glenn-cfd.exe artifacts/package/
           Copy-Item README.md,LICENSE artifacts/package/
           Copy-Item -Recurse docs artifacts/package/
+          New-Item -ItemType Directory -Force artifacts/package/models | Out-Null
+          Copy-Item 'ЦАГИ 846-14 (без прорезей).STL' artifacts/package/models/
           Copy-Item assets/fonts/LICENSE-DejaVu.txt artifacts/package/
           & "C:/Program Files/7-Zip/7z.exe" a -tzip -mx=5 "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip" ./artifacts/package/*
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -129,11 +131,32 @@ jobs:
           mkdir -p artifacts/package
           cp target/release/glenn-extended target/release/glenn-cfd README.md LICENSE assets/fonts/LICENSE-DejaVu.txt artifacts/package/
           cp -r docs artifacts/package/
+          mkdir -p artifacts/package/models
+          cp 'ЦАГИ 846-14 (без прорезей).STL' artifacts/package/models/
           tar -czf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C artifacts/package .
           rm -rf artifacts/package
           mkdir -p 'artifacts/Перенесённая программа'
           tar -xzf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C 'artifacts/Перенесённая программа'
           python3 scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd' tests/fixtures/cube.stl
+      - name: Prove the uploaded STL survives meshing and disturbs the flow
+        shell: bash
+        run: |
+          python scripts/test_uploaded_stl.py 'artifacts/Перенесённая программа/glenn-cfd${{ runner.os == 'Windows' && '.exe' || '' }}' 'artifacts/Перенесённая программа/models/ЦАГИ 846-14 (без прорезей).STL' artifacts/tsagi-case
+      - name: Capture the imported wing and its computed volume flow
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WGPU_BACKEND: vulkan
+        run: |
+          timeout 120s xvfb-run -a target/release/glenn-extended --screenshot artifacts/screenshots/tsagi-result.png --size 1440x1000 --cfd-case artifacts/tsagi-case
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: tsagi-logs-${{ matrix.platform }}
+          path: |
+            artifacts/tsagi-case/log.*
+            artifacts/tsagi-case/postProcessing/loads/**
+            artifacts/tsagi-case/constant/polyMesh/boundary
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-${{ matrix.platform }}
