@@ -328,6 +328,7 @@ impl Scene {
         let radius = ((hi - lo).max_element() * 0.002) as f32;
         let surface = glenn_extended::mesh::SurfaceIndex::new(mesh);
         for line in paths {
+            let mut travel = 0.0_f32;
             for pair in line.windows(2) {
                 if surface.crosses(pair[0], pair[1]) {
                     break;
@@ -338,14 +339,16 @@ impl Scene {
                 let mut rgb =
                     crate::ui::tunnel::speed_color(v / speed.max(1e-8)).to_normalized_gamma_f32();
                 rgb[3] = 0.75;
+                let next = travel + (pair[0].distance(pair[1]) / v.max(1e-8)) as f32;
                 scene.tube(
                     pair[0].as_vec3(),
                     pair[1].as_vec3(),
                     radius,
                     rgb,
-                    [2.0; 4],
-                    [2.0; 4],
+                    [1.0, travel, 0.0, 0.0],
+                    [1.0, next, 0.0, 0.0],
                 );
+                travel = next;
             }
         }
         scene

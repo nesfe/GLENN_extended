@@ -53,6 +53,9 @@ pub struct Volume {
     zoom: f32,
     slice: usize,
     quantity: usize,
+    animate: bool,
+    clock: f64,
+    last_frame: Option<f64>,
 }
 impl Default for Volume {
     fn default() -> Self {
@@ -133,6 +136,9 @@ impl Default for Volume {
             zoom: 1.0,
             slice: 12,
             quantity: 0,
+            animate: true,
+            clock: 0.0,
+            last_frame: None,
         }
     }
 }
@@ -164,6 +170,10 @@ impl Volume {
         self.mesh = Some(mesh);
         self.name = name;
         self.scale = 1.0;
+        self.zoom = 1.0;
+        self.yaw = -0.65;
+        self.pitch = 0.48;
+        self.slice = 0;
         self.dirty = true;
     }
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -188,6 +198,15 @@ impl Volume {
                         self.bounds = result.bounds;
                         self.name = "Сохранённый CFD-расчёт".into();
                     }
+                    // Default to the plane through the model, not a slice far
+                    // outside it (the old fixed index showed only free stream).
+                    let mid_z = (result.bounds.0.z + result.bounds.1.z) * 0.5;
+                    let field = &result.result.field;
+                    self.slice = (((mid_z - field.min.z) / (field.max.z - field.min.z))
+                        * (field.dims[2] - 1) as f64)
+                        .round()
+                        .clamp(0.0, (field.dims[2] - 1) as f64)
+                        as usize;
                     self.result = Some(result);
                     self.dirty = true;
                 }
@@ -238,6 +257,26 @@ impl Volume {
                 size.x, size.y, size.z
             ));
         });
+        // Show the imported model immediately, before settings that can scroll
+        // it below the window. Camera fitting uses its projected silhouette.
+        ui.horizontal(|ui| {
+            for (label, yaw, pitch) in [
+                ("Изометрия", -0.65, 0.48),
+                ("Сверху", 0.0, 1.57),
+                ("Сбоку", 0.0, 0.0),
+            ] {
+                if ui.button(label).clicked() {
+                    self.yaw = yaw;
+                    self.pitch = pitch;
+                    self.zoom = 1.0;
+                }
+            }
+            if ui.button("Вписать модель").clicked() {
+                self.zoom = 1.0;
+            }
+            ui.checkbox(&mut self.animate, "Движение по линиям тока");
+        });
+        self.viewport(ui);
         ui.horizontal_wrapped(|ui| {
             for (value, label) in [
                 (FlowModel::Laminar, "Ламинарный"),
@@ -369,7 +408,6 @@ impl Volume {
                 r.case_dir.display()
             ));
         }
-        self.viewport(ui);
         if let Some(result) = &self.result {
             show_slice(
                 ui,
@@ -417,7 +455,23 @@ impl Volume {
         let center = ((lo + hi) * 0.5).as_vec3();
         let length = (hi - lo).max_element() as f32;
         let aspect = rect.width() / rect.height();
-        let half = length / self.zoom;
+        let rotation =
+            glam::Mat4::from_rotation_x(self.pitch) * glam::Mat4::from_rotation_y(self.yaw);
+        let mut projected = glam::Vec3::ZERO;
+        for x in [lo.x, hi.x] {
+            for y in [lo.y, hi.y] {
+                for z in [lo.z, hi.z] {
+                    projected = projected.max(
+                        rotation
+                            .transform_vector3(
+                                glam::Vec3::new(x as f32, y as f32, z as f32) - center,
+                            )
+                            .abs(),
+                    );
+                }
+            }
+        }
+        let half = (projected.y.max(projected.x / aspect) * 1.3).max(length * 0.04) / self.zoom;
         let projection = glam::Mat4::orthographic_rh(
             -half * aspect,
             half * aspect,
@@ -426,15 +480,20 @@ impl Volume {
             -length * 20.0,
             length * 20.0,
         );
-        let camera = projection
-            * glam::Mat4::from_rotation_x(self.pitch)
-            * glam::Mat4::from_rotation_y(self.yaw)
-            * glam::Mat4::from_translation(-center);
+        let camera = projection * rotation * glam::Mat4::from_translation(-center);
+        let now = ui.input(|i| i.time);
+        if self.animate && self.result.is_some() {
+            self.clock += self
+                .last_frame
+                .map_or(0.0, |last| (now - last).clamp(0.0, 0.1));
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+        self.last_frame = Some(now);
         let px = ui.ctx().pixels_per_point();
         let texture = renderer.render(
             [(rect.width() * px) as u32, (rect.height() * px) as u32],
             camera,
-            0.0,
+            self.clock as f32,
         );
         ui.painter_at(rect).image(
             texture,

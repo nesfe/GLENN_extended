@@ -12,7 +12,8 @@ SOURCES = {
         'https://dl.openfoam.com/source/v2412/OpenFOAM-v2412.tgz',
         'c353930105c39b75dac7fa7cfbfc346390caa633a868130fd8c9816ef5f732cd'),
     'ThirdParty-v2412.tgz': (
-        'https://dl.openfoam.com/source/v2412/ThirdParty-v2412.tgz',
+        # Byte-identical pinned mirror already published with beta.2.
+        'https://github.com/nesfe/GLENN_extended/releases/download/v4.0.0-beta.2/ThirdParty-v2412.tgz',
         'a55f7f1401e227bf59fbfa318924e73db4069d61b937639d6031f23f58de7575'),
 }
 
