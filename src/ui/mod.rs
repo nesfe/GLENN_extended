@@ -84,6 +84,7 @@ pub struct Workbench {
     tunnel: tunnel::Tunnel,
     volume_flow: volume::Volume,
     native_flow: native::Native,
+    stl_tunnel: bool,
     potential_view: bool,
     /// The viscous field the drawn scene was traced through, and when it was
     /// taken, so a fast solver cannot outrun the tracer.
@@ -190,7 +191,10 @@ impl Workbench {
         }
         if let Some(path) = capture.as_ref().and_then(|c| c.cfd_case.clone()) {
             app.volume_flow.open_case(path);
-            app.page = 7;
+            app.stl_tunnel = true;
+            if app.page != 0 {
+                app.page = 7;
+            }
         }
         app.capture = capture;
         app
@@ -224,6 +228,7 @@ impl Workbench {
             tunnel: tunnel::Tunnel::default(),
             volume_flow: volume::Volume::default(),
             native_flow: native::Native::default(),
+            stl_tunnel: false,
             potential_view: false,
             scene_field: None,
             scene_tick: std::time::Instant::now(),
@@ -250,17 +255,22 @@ impl Workbench {
             self.importing = false;
             let message = result.map(|imported| match imported {
                 jobs::Imported::Profile(state, message) => {
+                    self.stl_tunnel = false;
                     self.state = state;
                     self.page = 1;
                     message
                 }
                 jobs::Imported::Project(state, message) => {
+                    self.stl_tunnel = false;
                     self.state = state;
                     message
                 }
                 jobs::Imported::Solid(mesh, name) => {
                     self.volume_flow.set_mesh(mesh, name.clone());
-                    self.page = 7;
+                    self.stl_tunnel = true;
+                    if self.page != 7 {
+                        self.page = 0;
+                    }
                     format!("STL «{name}» загружен. Выберите единицы координат и запустите CFD.")
                 }
             });
@@ -313,8 +323,11 @@ impl Workbench {
     }
     /// Whether the native viscous solver feeds what is on screen: the tunnel
     /// streamlines, or the section view itself.
+    fn volume_active(&self) -> bool {
+        self.page == 7 || (self.page == 0 && self.stl_tunnel)
+    }
     fn viscous_active(&self) -> bool {
-        (self.page == 8 || (self.page == 0 && !self.potential_view))
+        (self.page == 8 || (self.page == 0 && !self.stl_tunnel && !self.potential_view))
             && native::Native::unavailable_reason(&self.analysis).is_none()
     }
     fn recalculate(&mut self) {
@@ -337,7 +350,10 @@ impl Workbench {
                 }
             }
         }
-        let current = if self.page == 0 && !self.potential_view && self.analysis.state == self.state
+        let current = if self.page == 0
+            && !self.stl_tunnel
+            && !self.potential_view
+            && self.analysis.state == self.state
         {
             self.native_flow.snapshot_for(&self.analysis)
         } else {
@@ -372,7 +388,7 @@ impl Workbench {
         let request = jobs::Request {
             state: self.state.clone(),
             view: self.view.clone(),
-            scene: self.page == 0 && self.tunnel.renderer.is_some(),
+            scene: self.page == 0 && !self.stl_tunnel && self.tunnel.renderer.is_some(),
             viscous: self.scene_field.clone(),
         };
         if self
@@ -409,7 +425,7 @@ impl Workbench {
                         self.import_dialog();
                     }
                     if ui
-                        .add_enabled(self.page != 7, egui::Button::new("Сохранить проект"))
+                        .add_enabled(!self.volume_active(), egui::Button::new("Сохранить проект"))
                         .clicked()
                     {
                         self.export("json");
@@ -479,7 +495,7 @@ impl Workbench {
             ui.label(RichText::new(&self.status).small().color(MUTED));
         });
         self.regions.push(("footer", footer.response.rect));
-        if !compact && self.page != 7 {
+        if !compact && !self.volume_active() {
             let sidebar = egui::SidePanel::left("parameters")
                 .resizable(false)
                 .exact_width(294.0)
@@ -538,7 +554,7 @@ impl eframe::App for Workbench {
             self.import_dialog();
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
-            && self.page != 7
+            && !self.volume_active()
         {
             self.export("json");
         }
@@ -591,10 +607,14 @@ impl eframe::App for Workbench {
                 } else {
                     self.analysis.current.stall_fraction
                 },
-                self.volume,
+                if self.volume_active() {
+                    0.0
+                } else {
+                    self.volume
+                },
             );
         }
-        if self.view.animate && self.page == 0 {
+        if self.view.animate && self.page == 0 && !self.stl_tunnel {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
         if let Some(capture) = &self.capture {
@@ -696,7 +716,9 @@ mod tests {
         assert_eq!(app.state, saved);
         app.load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cube.stl"));
         wait(&mut app);
-        assert_eq!(app.page, 7);
+        assert_eq!(app.page, 0);
+        assert!(app.volume_active() && !app.viscous_active());
+        app.page = 7;
         assert!(app.import_message.as_ref().unwrap().is_ok());
         app.load(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ЦАГИ 846-14 (без прорезей).STL"),

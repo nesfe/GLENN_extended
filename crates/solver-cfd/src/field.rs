@@ -247,7 +247,7 @@ pub fn read_field(case: &Path, density: f64) -> Result<VolumeField, String> {
     }
     Ok(result)
 }
-pub(crate) fn loads(case: &Path) -> Result<(f64, DVec3), String> {
+pub(crate) fn loads(case: &Path) -> Result<Vec<(f64, DVec3)>, String> {
     let (_, dir) = latest(&case.join("postProcessing/loads"))?;
     let modern = dir.join("force.dat");
     let is_modern = modern.exists();
@@ -257,26 +257,32 @@ pub(crate) fn loads(case: &Path) -> Result<(f64, DVec3), String> {
         dir.join("forces.dat")
     };
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut history = Vec::new();
     for line in text
         .lines()
-        .rev()
-        .filter(|l| !l.trim_start().starts_with('#'))
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
     {
         let clean = line.replace(['(', ')'], " ");
         let v: Vec<f64> = clean
             .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if v.len() >= 10 && v.iter().all(|v| v.is_finite()) {
-            let force = if is_modern {
-                DVec3::new(v[1], v[2], v[3])
-            } else {
-                DVec3::new(v[1] + v[4] + v[7], v[2] + v[5] + v[8], v[3] + v[6] + v[9])
-            };
-            return Ok((v[0], force));
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map_err(|_| "Повреждённая запись сил OpenFOAM")?;
+        if v.len() < 10 || !v.iter().all(|n| n.is_finite()) {
+            return Err("Некорректная запись сил OpenFOAM".into());
         }
+        let force = if is_modern {
+            DVec3::new(v[1], v[2], v[3])
+        } else {
+            DVec3::new(v[1] + v[4] + v[7], v[2] + v[5] + v[8], v[3] + v[6] + v[9])
+        };
+        history.push((v[0], force));
     }
-    Err("Нет конечных сил из расчёта OpenFOAM".into())
+    if history.is_empty() {
+        return Err("Нет конечных сил из расчёта OpenFOAM".into());
+    }
+    Ok(history)
 }
 
 #[cfg(test)]
@@ -329,14 +335,14 @@ mod load_tests {
             "# Time total pressure viscous\n100 3 5 7 1 2 3 2 3 4\n",
         )
         .unwrap();
-        assert_eq!(loads(&root).unwrap(), (100.0, DVec3::new(3.0, 5.0, 7.0)));
+        assert_eq!(loads(&root).unwrap()[0], (100.0, DVec3::new(3.0, 5.0, 7.0)));
         fs::remove_file(dir.join("force.dat")).unwrap();
         fs::write(
             dir.join("forces.dat"),
             "100 ((1 2 3) (2 3 4) (0 0 0)) ((0 0 0) (0 0 0) (0 0 0))\n",
         )
         .unwrap();
-        assert_eq!(loads(&root).unwrap(), (100.0, DVec3::new(3.0, 5.0, 7.0)));
+        assert_eq!(loads(&root).unwrap()[0], (100.0, DVec3::new(3.0, 5.0, 7.0)));
         fs::remove_dir_all(root).unwrap();
     }
 }

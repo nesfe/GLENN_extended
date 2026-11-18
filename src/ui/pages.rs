@@ -7,15 +7,24 @@ impl Workbench {
             controls::show(ui, &mut self.state, &mut self.control_tab);
             return;
         }
-        if self.page == 7 {
-            if ui.button("Открыть STL…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("STL модель", &["stl", "STL"])
-                    .pick_file()
+        if self.page == 0 || self.page == 7 {
+            ui.horizontal_wrapped(|ui| {
+                if self.page == 0 {
+                    ui.selectable_value(&mut self.stl_tunnel, false, "Параметрическое крыло");
+                    ui.selectable_value(&mut self.stl_tunnel, true, "Модель STL");
+                }
+                if ui.button("Открыть STL…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("STL модель", &["stl", "STL"])
+                        .pick_file()
+                {
+                    self.load(path);
+                }
+            });
+        }
+        if self.volume_active() {
+            if self.page == 7 && ui.button("Передать текущее крыло в CFD").clicked()
             {
-                self.load(path);
-            }
-            if ui.button("Передать текущее крыло в CFD").clicked() {
                 let faces = self
                     .analysis
                     .mesh

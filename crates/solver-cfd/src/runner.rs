@@ -20,6 +20,9 @@ pub struct Backend {
 pub struct RunResult {
     pub field: VolumeField,
     pub force: DVec3,
+    pub force_history: Vec<(f64, DVec3)>,
+    /// Initial equation residual at the first solve of each time step.
+    pub residuals: [Vec<(f64, f64)>; 4],
     pub case_dir: PathBuf,
     pub converged: bool,
     pub streamlines: Vec<Vec<DVec3>>,
@@ -305,6 +308,31 @@ pub fn run(
     })
 }
 
+fn residual_history(log: &str, end: f64) -> [Vec<(f64, f64)>; 4] {
+    let mut series: [Vec<(f64, f64)>; 4] = Default::default();
+    let mut time = None;
+    for line in log.lines() {
+        if let Some(value) = line.trim().strip_prefix("Time = ") {
+            time = value
+                .parse::<f64>()
+                .ok()
+                .filter(|t| t.is_finite() && *t <= end);
+        } else if let Some(t) = time
+            && let Some((_, fields)) = line.split_once("Solving for ")
+            && let Some((name, values)) = fields.split_once(", Initial residual = ")
+            && let Some(index) = ["Ux", "Uy", "Uz", "p"].iter().position(|n| *n == name)
+            && series[index].last().is_none_or(|&(last, _)| t > last)
+            && let Some(value) = values
+                .split(',')
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            series[index].push((t, value));
+        }
+    }
+    series
+}
 /// Reopen a completed case without rerunning or mixing it with current inputs.
 pub fn load_result(case: &Path) -> Result<RunResult, String> {
     body_faces(case)?;
@@ -319,11 +347,13 @@ pub fn load_result(case: &Path) -> Result<RunResult, String> {
         "simpleFoam"
     };
     let field = read_field(case, cfg.density)?;
-    let (force_time, force) = crate::field::loads(case)?;
+    let force_history = crate::field::loads(case)?;
+    let &(force_time, force) = force_history.last().ok_or("Нет истории сил")?;
     if (force_time - field.time).abs() > 1e-5 * field.time.abs().max(1.0) {
         return Err("Силы и поле относятся к разным моментам; результат не опубликован".into());
     }
     let log = fs::read_to_string(case.join(format!("log.{solver}"))).map_err(|e| e.to_string())?;
+    let residuals = residual_history(&log, field.time);
     let converged = log.contains("SIMPLE solution converged");
     let bounds = if case.join("body-bounds.json").is_file() {
         let (lo, hi): ([f64; 3], [f64; 3]) = serde_json::from_str(
@@ -338,6 +368,8 @@ pub fn load_result(case: &Path) -> Result<RunResult, String> {
     Ok(RunResult {
         field,
         force,
+        force_history,
+        residuals,
         case_dir: case.to_path_buf(),
         converged,
         streamlines,

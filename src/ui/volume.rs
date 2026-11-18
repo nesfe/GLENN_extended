@@ -1,6 +1,6 @@
 //! Volume workbench. Owns presentation only; cases run in glenn-solver-cfd.
 use super::{
-    plots::{AMBER, CYAN, MUTED},
+    plots::{AMBER, CYAN},
     render,
 };
 use eframe::egui::{self, Color32, Vec2};
@@ -53,6 +53,8 @@ pub struct Volume {
     zoom: f32,
     slice: usize,
     quantity: usize,
+    tab: usize,
+    slice_map: Option<SliceMap>,
     animate: bool,
     clock: f64,
     last_frame: Option<f64>,
@@ -136,6 +138,8 @@ impl Default for Volume {
             zoom: 1.0,
             slice: 12,
             quantity: 0,
+            tab: 0,
+            slice_map: None,
             animate: true,
             clock: 0.0,
             last_frame: None,
@@ -161,6 +165,8 @@ impl Volume {
         self.worker.cancel();
         self.busy = false;
         self.result = None;
+        self.tab = 0;
+        self.slice_map = None;
         self.error = None;
         self.bounds = mesh.bounds();
         let mesh = Arc::new(mesh);
@@ -207,6 +213,7 @@ impl Volume {
                         .round()
                         .clamp(0.0, (field.dims[2] - 1) as f64)
                         as usize;
+                    self.slice_map = None;
                     self.result = Some(result);
                     self.dirty = true;
                 }
@@ -257,102 +264,6 @@ impl Volume {
                 size.x, size.y, size.z
             ));
         });
-        // Show the imported model immediately, before settings that can scroll
-        // it below the window. Camera fitting uses its projected silhouette.
-        ui.horizontal(|ui| {
-            for (label, yaw, pitch) in [
-                ("Изометрия", -0.65, 0.48),
-                ("Сверху", 0.0, 1.57),
-                ("Сбоку", 0.0, 0.0),
-            ] {
-                if ui.button(label).clicked() {
-                    self.yaw = yaw;
-                    self.pitch = pitch;
-                    self.zoom = 1.0;
-                }
-            }
-            if ui.button("Вписать модель").clicked() {
-                self.zoom = 1.0;
-            }
-            ui.checkbox(&mut self.animate, "Движение по линиям тока");
-        });
-        self.viewport(ui);
-        ui.horizontal_wrapped(|ui| {
-            for (value, label) in [
-                (FlowModel::Laminar, "Ламинарный"),
-                (FlowModel::SteadyRans, "Стационарный RANS SST"),
-                (FlowModel::UnsteadyRans, "Нестационарный URANS SST"),
-            ] {
-                ui.selectable_value(&mut self.cfg.model, value, label);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Сетка:");
-            for (value, label) in [
-                (Resolution::Preview, "Быстрый просмотр"),
-                (Resolution::Standard, "Средняя"),
-                (Resolution::Fine, "Подробная"),
-            ] {
-                ui.selectable_value(&mut self.cfg.resolution, value, label);
-            }
-        });
-        if self.cfg.resolution == Resolution::Preview {
-            ui.colored_label(AMBER,"Грубая сетка без призматических слоёв: только предварительное исследование потока, не проверенная точность сил/отрыва.");
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut self.cfg.speed)
-                    .range(0.001..=100.0)
-                    .speed(0.2)
-                    .prefix("V, м/с: "),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.cfg.alpha_degrees)
-                    .range(-90.0..=90.0)
-                    .speed(0.2)
-                    .prefix("α, °: "),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.cfg.density)
-                    .range(0.001..=20000.0)
-                    .speed(0.01)
-                    .prefix("ρ, кг/м³: "),
-            );
-            ui.add(
-                egui::DragValue::new(&mut self.cfg.kinematic_viscosity)
-                    .range(1e-9..=1.0)
-                    .speed(1e-6)
-                    .max_decimals(9)
-                    .prefix("ν, м²/с: "),
-            );
-        });
-        ui.horizontal_wrapped(|ui| {
-            if self.cfg.model != FlowModel::UnsteadyRans {
-                ui.add(
-                    egui::DragValue::new(&mut self.cfg.iterations)
-                        .range(10..=100000)
-                        .prefix("Итерации: "),
-                );
-            }
-            if self.cfg.model == FlowModel::UnsteadyRans {
-                ui.add(
-                    egui::DragValue::new(&mut self.cfg.transit_times)
-                        .range(0.1..=1000.0)
-                        .prefix("Время, L/V: "),
-                );
-            }
-            ui.label(format!(
-                "Re по максимальному габариту: {:.3e}",
-                self.cfg.speed * (hi - lo).max_element() * self.scale
-                    / self.cfg.kinematic_viscosity
-            ));
-        });
-        ui.collapsing("Каталог расчётов и дополнительные настройки",|ui| {
-            ui.checkbox(&mut self.backend.wsl,"Запуск через WSL (Windows)");
-            ui.label("Внешний OpenFOAM etc/bashrc (для разработчиков); пусто — комплектный решатель:");ui.text_edit_singleline(&mut self.backend.bashrc);
-            ui.small("Обычный запуск использует решатель из полного архива GLENN. Эти настройки нужны только для замены расчётного модуля.");
-            ui.label("Каталог результатов (каждый запуск — отдельная папка):");ui.text_edit_singleline(&mut self.folder);
-        });
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!self.busy, egui::Button::new("Рассчитать продувку"))
@@ -384,6 +295,116 @@ impl Volume {
             }
         });
         ui.label(self.progress.lock().unwrap().clone());
+        ui.horizontal_wrapped(|ui| {
+            for (index, label) in ["3D-поток", "Срез поля", "Графики", "Настройки"]
+                .into_iter()
+                .enumerate()
+            {
+                ui.add_enabled_ui(index == 0 || index == 3 || self.result.is_some(), |ui| {
+                    ui.selectable_value(&mut self.tab, index, label);
+                });
+            }
+        });
+        if self.tab == 0 {
+            // Show the imported model immediately, before settings that can scroll
+            // it below the window. Camera fitting uses its projected silhouette.
+            ui.horizontal_wrapped(|ui| {
+                for (label, yaw, pitch) in [
+                    ("Изометрия", -0.65, 0.48),
+                    ("Сверху", 0.0, 1.57),
+                    ("Сбоку", 0.0, 0.0),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.yaw = yaw;
+                        self.pitch = pitch;
+                        self.zoom = 1.0;
+                    }
+                }
+                if ui.button("Вписать модель").clicked() {
+                    self.zoom = 1.0;
+                }
+                ui.checkbox(&mut self.animate, "Движение по линиям тока");
+            });
+            self.viewport(ui);
+        }
+        if self.tab == 3 {
+            ui.horizontal_wrapped(|ui| {
+                for (value, label) in [
+                    (FlowModel::Laminar, "Ламинарный"),
+                    (FlowModel::SteadyRans, "Стационарный RANS SST"),
+                    (FlowModel::UnsteadyRans, "Нестационарный URANS SST"),
+                ] {
+                    ui.selectable_value(&mut self.cfg.model, value, label);
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Сетка:");
+                for (value, label) in [
+                    (Resolution::Preview, "Быстрый просмотр"),
+                    (Resolution::Standard, "Средняя"),
+                    (Resolution::Fine, "Подробная"),
+                ] {
+                    ui.selectable_value(&mut self.cfg.resolution, value, label);
+                }
+            });
+            if self.cfg.resolution == Resolution::Preview {
+                ui.colored_label(AMBER,"Грубая сетка без призматических слоёв: только предварительное исследование потока, не проверенная точность сил/отрыва.");
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.speed)
+                        .range(0.001..=100.0)
+                        .speed(0.2)
+                        .prefix("V, м/с: "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.alpha_degrees)
+                        .range(-90.0..=90.0)
+                        .speed(0.2)
+                        .prefix("α, °: "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.density)
+                        .range(0.001..=20000.0)
+                        .speed(0.01)
+                        .prefix("ρ, кг/м³: "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.kinematic_viscosity)
+                        .range(1e-9..=1.0)
+                        .speed(1e-6)
+                        .max_decimals(9)
+                        .prefix("ν, м²/с: "),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                if self.cfg.model != FlowModel::UnsteadyRans {
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.iterations)
+                            .range(10..=100000)
+                            .prefix("Итерации: "),
+                    );
+                }
+                if self.cfg.model == FlowModel::UnsteadyRans {
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.transit_times)
+                            .range(0.1..=1000.0)
+                            .prefix("Время, L/V: "),
+                    );
+                }
+                ui.label(format!(
+                    "Re по максимальному габариту: {:.3e}",
+                    self.cfg.speed * (hi - lo).max_element() * self.scale
+                        / self.cfg.kinematic_viscosity
+                ));
+            });
+            ui.collapsing("Каталог расчётов и дополнительные настройки",|ui| {
+            ui.checkbox(&mut self.backend.wsl,"Запуск через WSL (Windows)");
+            ui.label("Внешний OpenFOAM etc/bashrc (для разработчиков); пусто — комплектный решатель:");ui.text_edit_singleline(&mut self.backend.bashrc);
+            ui.small("Обычный запуск использует решатель из полного архива GLENN. Эти настройки нужны только для замены расчётного модуля.");
+            ui.label("Каталог результатов (каждый запуск — отдельная папка):");ui.text_edit_singleline(&mut self.folder);
+        });
+        }
         if let Some(completed) = &self.result {
             if completed.settings
                 != serde_json::to_string(&self.cfg).unwrap() + &self.scale.to_string()
@@ -408,12 +429,20 @@ impl Volume {
                 r.case_dir.display()
             ));
         }
-        if let Some(result) = &self.result {
+        if self.tab == 2
+            && let Some(result) = &self.result
+        {
+            charts(ui, result);
+        }
+        if self.tab == 1
+            && let Some(result) = &self.result
+        {
             show_slice(
                 ui,
                 &result.result.field,
                 &mut self.slice,
                 &mut self.quantity,
+                &mut self.slice_map,
             );
         }
         ui.small("Отрыв исследуйте по обратной скорости в следе и завихренности; для выводов нужны сходимость, независимость от сетки, y+ и сравнение с экспериментом. URANS не разрешает все турбулентные вихри.");
@@ -423,8 +452,13 @@ impl Volume {
             ui.label("Подготовка геометрии для отображения…");
             return;
         }
-        let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 350.0), egui::Sense::drag());
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(
+                ui.available_width(),
+                (ui.ctx().content_rect().height() * 0.64).clamp(275.0, 1200.0),
+            ),
+            egui::Sense::drag(),
+        );
         if response.dragged() {
             let d = ui.input(|i| i.pointer.delta());
             self.yaw += d.x * 0.008;
@@ -503,11 +537,83 @@ impl Volume {
         );
     }
 }
+struct SliceMap {
+    slice: usize,
+    quantity: usize,
+    texture: egui::TextureHandle,
+    range: (f64, f64),
+}
+fn charts(ui: &mut egui::Ui, completed: &Completed) {
+    use super::plots::plot;
+    use glenn_extended::model::Point;
+    let r = &completed.result;
+    let x = if completed.config.model == FlowModel::UnsteadyRans {
+        "Время, с"
+    } else {
+        "Итерация SIMPLE"
+    };
+    let colors = [CYAN, AMBER, Color32::LIGHT_GREEN, Color32::LIGHT_RED];
+    let forces: [Vec<Point>; 3] = std::array::from_fn(|i| {
+        r.force_history
+            .iter()
+            .map(|(t, f)| Point::new(*t, f[i]))
+            .collect()
+    });
+    plot(
+        ui,
+        "Силы на модели",
+        x,
+        "Н",
+        &[
+            ("Fx", &forces[0], colors[0]),
+            ("Fy", &forces[1], colors[1]),
+            ("Fz", &forces[2], colors[2]),
+        ],
+        false,
+    );
+    let residuals: [Vec<Point>; 4] = std::array::from_fn(|i| {
+        r.residuals[i]
+            .iter()
+            .filter(|(_, v)| *v > 0.0)
+            .map(|(t, v)| Point::new(*t, v.log10()))
+            .collect()
+    });
+    if residuals.iter().any(|s| !s.is_empty()) {
+        plot(
+            ui,
+            "Начальные невязки уравнений",
+            x,
+            "log₁₀ r",
+            &[
+                ("Ux", &residuals[0], colors[0]),
+                ("Uy", &residuals[1], colors[1]),
+                ("Uz", &residuals[2], colors[2]),
+                ("p", &residuals[3], colors[3]),
+            ],
+            false,
+        );
+    }
+}
+fn slice_color(t: f64) -> Color32 {
+    let colors = [
+        [34., 44., 110.],
+        [39., 119., 175.],
+        [70., 187., 162.],
+        [225., 216., 91.],
+        [231., 95., 48.],
+    ];
+    let position = t.clamp(0.0, 1.0) * 4.;
+    let i = (position as usize).min(3);
+    let channel =
+        |k: usize| (colors[i][k] + (position - i as f64) * (colors[i + 1][k] - colors[i][k])) as u8;
+    Color32::from_rgb(channel(0), channel(1), channel(2))
+}
 fn show_slice(
     ui: &mut egui::Ui,
     field: &cfd::VolumeField,
     slice: &mut usize,
     quantity: &mut usize,
+    cache: &mut Option<SliceMap>,
 ) {
     ui.horizontal_wrapped(|ui| {
         ui.add(egui::Slider::new(slice, 0..=field.dims[2] - 1).text("Сечение Z"));
@@ -525,61 +631,85 @@ fn show_slice(
     };
     let offset = *slice * field.dims[0] * field.dims[1];
     let count = field.dims[0] * field.dims[1];
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for i in offset..offset + count {
-        if let Some(v) = val(i) {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-    }
-    if !lo.is_finite() {
-        ui.label("Нет поля в этом сечении");
-        return;
-    }
-    ui.label(format!(
-        "Z = {:.4} м · диапазон [{lo:.4}; {hi:.4}] · тёмные области: нет данных / тело",
-        field.position(offset).z
-    ));
-    let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 260.0), egui::Sense::hover());
-    let ratio = ((field.max.x - field.min.x) / (field.max.y - field.min.y)) as f32;
-    let width = rect.width().min(rect.height() * ratio);
-    let height = width / ratio;
-    let rect = egui::Rect::from_center_size(rect.center(), Vec2::new(width, height));
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0, Color32::from_rgb(9, 17, 27));
-    let w = rect.width() / field.dims[0] as f32;
-    let h = rect.height() / field.dims[1] as f32;
-    for y in 0..field.dims[1] {
-        for x in 0..field.dims[0] {
-            let i = offset + y * field.dims[0] + x;
-            let point = rect.left_bottom() + Vec2::new(x as f32 * w, -((y + 1) as f32) * h);
-            if let Some(v) = val(i) {
-                let t = ((v - lo) / (hi - lo).max(1e-12)) as f32;
-                let color = Color32::from_rgb(
-                    (230.0 * t) as u8,
-                    (90.0 + 110.0 * (1.0 - (2.0 * t - 1.0).abs())) as u8,
-                    (230.0 * (1.0 - t)) as u8,
+    let [nx, ny, _] = field.dims;
+    if cache
+        .as_ref()
+        .is_none_or(|c| (c.slice, c.quantity) != (*slice, *quantity))
+    {
+        let (lo, hi) = (offset..offset + count)
+            .filter_map(val)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        let mut pixels = Vec::with_capacity(count);
+        for y in (0..ny).rev() {
+            for x in 0..nx {
+                pixels.push(
+                    val(offset + y * nx + x).map_or(Color32::from_rgb(9, 17, 27), |v| {
+                        slice_color((v - lo) / (hi - lo).max(1e-12))
+                    }),
                 );
-                painter.rect_filled(
-                    egui::Rect::from_min_size(point, Vec2::new(w + 0.2, h + 0.2)),
-                    0,
-                    color,
-                );
-                if x % 3 == 0
-                    && y % 3 == 0
-                    && let Some(v) = field.velocity[i]
-                {
-                    let d = Vec2::new(v.x as f32, -v.y as f32).normalized() * w * 1.8;
-                    painter.arrow(
-                        point + Vec2::new(w, h) * 0.5,
-                        d,
-                        egui::Stroke::new(1.0, Color32::WHITE),
-                    );
-                }
             }
         }
+        let texture = ui.ctx().load_texture(
+            "cfd-slice",
+            egui::ColorImage::new([nx, ny], pixels),
+            egui::TextureOptions::NEAREST,
+        );
+        *cache = Some(SliceMap {
+            slice: *slice,
+            quantity: *quantity,
+            texture,
+            range: (lo, hi),
+        });
     }
-    ui.colored_label(CYAN,"Стрелки — направление скорости в XY. Отрицательная скорость X означает возвратное течение.");
-    ui.colored_label(MUTED,"Сечение интерполировано из CFD; мгновенные линии тока не являются траекториями частиц во времени.");
+    let c = cache.as_ref().unwrap();
+    let (lo, hi) = c.range;
+    if !lo.is_finite() {
+        ui.label("Нет данных в этом сечении");
+        return;
+    }
+    let unit = ["м/с", "Па", "1/с"][*quantity];
+    ui.label(format!(
+        "Z = {:.3} м · тёмные ячейки вне поля данных",
+        field.position(offset).z
+    ));
+    let w = ui.available_width();
+    let ratio = ((field.max.x - field.min.x) / (field.max.y - field.min.y)) as f32;
+    let h = (w / ratio).min(ui.ctx().content_rect().height() * 0.60);
+    let response = ui.add(
+        egui::Image::new((c.texture.id(), Vec2::new(h * ratio, h))).sense(egui::Sense::hover()),
+    );
+    if let Some(p) = response.hover_pos() {
+        let rect = response.rect;
+        let x = (((p.x - rect.left()) / rect.width() * nx as f32) as usize).min(nx - 1);
+        let y = (((rect.bottom() - p.y) / rect.height() * ny as f32) as usize).min(ny - 1);
+        let i = offset + y * nx + x;
+        let pos = field.position(i);
+        response.on_hover_text(format!(
+            "X {:.3} м · Y {:.3} м · {}",
+            pos.x,
+            pos.y,
+            val(i).map_or_else(|| "нет данных".to_string(), |v| format!("{v:.4} {unit}"))
+        ));
+    }
+    ui.horizontal(|ui| {
+        ui.label(format!("{lo:.3}"));
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width().min(180.0), 12.0),
+            egui::Sense::hover(),
+        );
+        for i in 0..64 {
+            let x = rect.left() + i as f32 * rect.width() / 64.0;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(x, rect.top()),
+                    Vec2::new(rect.width() / 64.0 + 0.5, rect.height()),
+                ),
+                0,
+                slice_color(i as f64 / 63.0),
+            );
+        }
+        ui.label(format!("{hi:.3} {unit}"));
+    });
 }
