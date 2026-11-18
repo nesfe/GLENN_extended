@@ -18,12 +18,12 @@ pub struct Scene {
 /// Does the flow just off the skin run back towards the nose? Measured along
 /// the local surface tangent, not along the chord: air rounding the leading
 /// edge moves backwards in chord coordinates while still firmly attached.
-fn separated(
+fn skin_samples(
     field: &dyn glenn_extended::physics::flow::SectionField,
     foil: &glenn_extended::geometry::Airfoil,
     local: Point,
     upper: bool,
-) -> bool {
+) -> (bool, Option<f64>) {
     let line = if upper { &foil.upper } else { &foil.lower };
     let (ahead, behind) = ((local.x - 0.02).max(0.0), (local.x + 0.02).min(1.0));
     let tangent = Point::new(
@@ -32,7 +32,7 @@ fn separated(
     );
     let length = tangent.x.hypot(tangent.y);
     if length < 1e-9 {
-        return false;
+        return (false, None);
     }
     let tangent = Point::new(tangent.x / length, tangent.y / length);
     // Outward normal, flipped for the lower surface.
@@ -44,12 +44,13 @@ fn separated(
     // Real separation has thickness. A single near-wall sample also goes
     // negative in the one-cell layer the lattice cannot resolve at this
     // Reynolds number, which would paint an attached section orange.
-    [0.04, 0.08].iter().all(|offset| {
-        let probe = Point::new(local.x + nx * offset, local.y + ny * offset);
+    let probe = |offset: f64| Point::new(local.x + nx * offset, local.y + ny * offset);
+    let reversed = [0.04, 0.08].into_iter().all(|offset| {
         field
-            .sample(probe)
+            .sample(probe(offset))
             .is_some_and(|u| u.x * tangent.x + u.y * tangent.y < -0.02)
-    })
+    });
+    (reversed, field.pressure_coefficient(probe(0.04)))
 }
 impl Scene {
     /// Root-section viscous field in the actual wing frame. No spanwise
@@ -136,49 +137,65 @@ impl Scene {
         let section_size = contour.len();
         // Each section uses its own incidence, so twist also changes surface Cp.
         let mut pressures = Vec::new();
-        for section in positions.chunks(section_size) {
-            let eta = (section[0].z as f64 / (state.span * 0.5)).abs().min(1.0);
-            pressures.push(
-                if state.profile_type == glenn_extended::model::Profile::Cylinder {
-                    let spin = (state.cylinder_rpm * std::f64::consts::TAU / 60.0
-                        * state.mean_chord()
-                        * 0.5
-                        / state.velocity.max(0.1))
-                    .clamp(-4.0, 4.0);
-                    analysis
-                        .panel
-                        .cylinder_pressure(state.alpha + state.twist * eta, spin)
-                } else {
-                    analysis.panel.evaluate(
-                        state.alpha + state.twist * eta,
-                        analysis.current.mach * state.sweep.to_radians().cos(),
-                    )
-                },
-            );
+        if viscous.is_none() {
+            for section in positions.chunks(section_size) {
+                let eta = (section[0].z as f64 / (state.span * 0.5)).abs().min(1.0);
+                pressures.push(
+                    if state.profile_type == glenn_extended::model::Profile::Cylinder {
+                        let spin = (state.cylinder_rpm * std::f64::consts::TAU / 60.0
+                            * state.mean_chord()
+                            * 0.5
+                            / state.velocity.max(0.1))
+                        .clamp(-4.0, 4.0);
+                        analysis
+                            .panel
+                            .cylinder_pressure(state.alpha + state.twist * eta, spin)
+                    } else {
+                        analysis.panel.evaluate(
+                            state.alpha + state.twist * eta,
+                            analysis.current.mach * state.sweep.to_radians().cos(),
+                        )
+                    },
+                );
+            }
         }
+        let skin: Vec<_> = viscous
+            .into_iter()
+            .flat_map(|field| {
+                contour.iter().enumerate().map(move |(i, &p)| {
+                    skin_samples(field, &analysis.foil, p, i < analysis.foil.upper.len() - 1)
+                })
+            })
+            .collect();
         for triangle in &analysis.mesh.triangles {
             for &i in triangle {
                 let local = contour[i % section_size];
-                let pressure = &pressures[(i / section_size).min(pressures.len() - 1)];
-                let upper = i % section_size < analysis.foil.upper.len() - 1;
-                let surface = if upper {
-                    &pressure.upper
+                let (detached, cp) = if let Some(&sample) = skin.get(i % section_size) {
+                    sample
                 } else {
-                    &pressure.lower
+                    let pressure = &pressures[(i / section_size).min(pressures.len() - 1)];
+                    let upper = i % section_size < analysis.foil.upper.len() - 1;
+                    (
+                        false,
+                        Some(interpolate(
+                            if upper {
+                                &pressure.upper
+                            } else {
+                                &pressure.lower
+                            },
+                            local.x,
+                        )),
+                    )
                 };
-                let cp = interpolate(surface, local.x);
-                // Separated skin is marked on the wing itself: without it the
-                // detachment is only a few hundredths of a chord thick and
-                // disappears at any view that shows the whole wing.
-                let detached =
-                    viscous.is_some_and(|field| separated(field, &analysis.foil, local, upper));
                 let rgb = if i >= positions.len() - 2 {
                     [0.36, 0.46, 0.55, 1.0]
                 } else if detached {
                     // Crimson: no Cp palette reaches it, so separation never
                     // reads as just another pressure level.
                     [0.70, 0.08, 0.20, 1.0]
-                } else if view.pressure {
+                } else if view.pressure
+                    && let Some(cp) = cp
+                {
                     color(cp, view.palette).to_normalized_gamma_f32()
                 } else {
                     [0.62, 0.75, 0.82, 1.0]

@@ -55,6 +55,9 @@ pub struct Volume {
     quantity: usize,
     tab: usize,
     slice_map: Option<SliceMap>,
+    show_lines: bool,
+    reference_area: f64,
+    comparison: super::volume_compare::Comparison,
     animate: bool,
     clock: f64,
     last_frame: Option<f64>,
@@ -140,6 +143,9 @@ impl Default for Volume {
             quantity: 0,
             tab: 0,
             slice_map: None,
+            reference_area: 0.0,
+            comparison: Default::default(),
+            show_lines: true,
             animate: true,
             clock: 0.0,
             last_frame: None,
@@ -164,6 +170,7 @@ impl Volume {
     pub fn set_mesh(&mut self, mesh: SolidMesh, name: String) {
         self.worker.cancel();
         self.busy = false;
+        self.comparison.reset();
         self.result = None;
         self.tab = 0;
         self.slice_map = None;
@@ -175,6 +182,7 @@ impl Volume {
         self.preview_busy = true;
         self.mesh = Some(mesh);
         self.name = name;
+        self.reference_area = 0.0;
         self.scale = 1.0;
         self.zoom = 1.0;
         self.yaw = -0.65;
@@ -198,6 +206,7 @@ impl Volume {
             match result {
                 Ok(result) => {
                     if result.loaded {
+                        self.reference_area = 0.0;
                         self.cfg = result.config.clone();
                         self.scale = 1.0;
                         self.mesh = Some(Arc::new(result.mesh.clone()));
@@ -214,6 +223,7 @@ impl Volume {
                         .clamp(0.0, (field.dims[2] - 1) as f64)
                         as usize;
                     self.slice_map = None;
+                    self.comparison.reset();
                     self.result = Some(result);
                     self.dirty = true;
                 }
@@ -226,8 +236,7 @@ impl Volume {
     }
     pub fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("Объёмная CFD · STL / крыло");
-        ui.label("OpenFOAM: вязкое несжимаемое обтекание. Линии, скорость, завихренность и силы — из одного расчёта.");
-        ui.small("Панельные силы и эмпирический срыв в этом режиме не используются. Для высоких чисел Маха нужен другой расчётный модуль.");
+        ui.label(format!("OpenFOAM 2412 · {}", self.cfg.solver()));
         if let Some(error) = &self.error {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.colored_label(AMBER, error);
@@ -294,7 +303,9 @@ impl Volume {
                 }
             }
         });
-        ui.label(self.progress.lock().unwrap().clone());
+        if self.busy {
+            ui.label(self.progress.lock().unwrap().clone());
+        }
         ui.horizontal_wrapped(|ui| {
             for (index, label) in ["3D-поток", "Срез поля", "Графики", "Настройки"]
                 .into_iter()
@@ -323,11 +334,32 @@ impl Volume {
                 if ui.button("Вписать модель").clicked() {
                     self.zoom = 1.0;
                 }
-                ui.checkbox(&mut self.animate, "Движение по линиям тока");
+                ui.checkbox(&mut self.show_lines, "Линии тока");
+                ui.checkbox(&mut self.animate, "Анимация");
             });
             self.viewport(ui);
         }
         if self.tab == 3 {
+            let mut air = self.cfg.air_temperature.is_some();
+            if ui
+                .checkbox(&mut air, "Сжимаемый воздух · уравнение энергии")
+                .changed()
+            {
+                self.cfg.air_temperature = air.then_some(288.15);
+            }
+            if let Some(t) = &mut self.cfg.air_temperature {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::DragValue::new(t)
+                            .range(150.0..=500.0)
+                            .prefix("Температура, К "),
+                    );
+                    ui.label(format!(
+                        "M = {:.3}",
+                        self.cfg.speed / Config::sound_speed(*t)
+                    ));
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 for (value, label) in [
                     (FlowModel::Laminar, "Ламинарный"),
@@ -353,7 +385,13 @@ impl Volume {
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::DragValue::new(&mut self.cfg.speed)
-                        .range(0.001..=100.0)
+                        .range(
+                            0.001
+                                ..=self
+                                    .cfg
+                                    .air_temperature
+                                    .map_or(100.0, |t| 0.95 * Config::sound_speed(t)),
+                        )
                         .speed(0.2)
                         .prefix("V, м/с: "),
                 );
@@ -419,6 +457,11 @@ impl Volume {
                 "t = {:.6} · Fx {:.4} Н · Fy {:.4} Н · Fz {:.4} Н",
                 r.field.time, r.force.x, r.force.y, r.force.z
             ));
+            if let Some([min, max, avg]) = r.wall_y_plus {
+                ui.label(format!(
+                    "Стенка модели · y⁺ мин. {min:.1} · сред. {avg:.1} · макс. {max:.1}"
+                ));
+            }
             if completed.config.model == FlowModel::UnsteadyRans {
                 ui.colored_label(AMBER, "Мгновенное поле URANS. Для средних сил требуется установившаяся статистика во времени.");
             } else if !r.converged {
@@ -433,6 +476,68 @@ impl Volume {
             && let Some(result) = &self.result
         {
             charts(ui, result);
+            if !result.result.wall_pressure.is_empty() {
+                let f = &result.result.field;
+                ui.add(
+                    egui::Slider::new(&mut self.slice, 0..=f.dims[2] - 1)
+                        .text("Сечение давления Z"),
+                );
+                let dz = (f.max.z - f.min.z) / (f.dims[2] - 1) as f64;
+                let z = f.min.z + dz * self.slice as f64;
+                let q = 0.5 * result.config.density * result.config.speed.powi(2);
+                let cp: Vec<_> = result
+                    .result
+                    .wall_pressure
+                    .iter()
+                    .filter(|(p, _)| (p.z - z).abs() <= dz * 0.5)
+                    .map(|(p, v)| glenn_extended::model::Point::new(p.x, v / q))
+                    .collect();
+                ui.label(format!(
+                    "Z = {z:.3} ± {:.3} м · {} граней",
+                    dz * 0.5,
+                    cp.len()
+                ));
+                super::plots::scatter(ui, "Давление на стенке", "X, м", "Cp", &cp);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Опорная площадь крыла, м²");
+                ui.add(
+                    egui::DragValue::new(&mut self.reference_area)
+                        .range(0.0..=1e8)
+                        .speed(0.01),
+                );
+                if let Some((cl, cd)) = result
+                    .config
+                    .coefficients(result.result.force, self.reference_area)
+                {
+                    ui.label(format!("CL {cl:.5} · CD {cd:.5}"));
+                }
+            });
+            self.comparison
+                .show(ui, &result.result, &result.config, self.reference_area);
+            if ui.button("Сохранить историю сил CSV…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("forces.csv")
+                    .save_file()
+            {
+                let mut csv = String::from(if result.config.model == FlowModel::UnsteadyRans {
+                    "time_s"
+                } else {
+                    "iteration"
+                });
+                csv.push_str(",Fx_N,Fy_N,Fz_N,CL,CD\n");
+                for &(t, f) in &result.result.force_history {
+                    use std::fmt::Write;
+                    let coeff = result
+                        .config
+                        .coefficients(f, self.reference_area)
+                        .map_or_else(|| ",".to_owned(), |(cl, cd)| format!("{cl},{cd}"));
+                    writeln!(&mut csv, "{t},{},{},{},{coeff}", f.x, f.y, f.z).unwrap();
+                }
+                if let Err(e) = std::fs::write(path, csv) {
+                    self.error = Some(e.to_string());
+                }
+            }
         }
         if self.tab == 1
             && let Some(result) = &self.result
@@ -455,7 +560,7 @@ impl Volume {
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(
                 ui.available_width(),
-                (ui.ctx().content_rect().height() * 0.64).clamp(275.0, 1200.0),
+                (ui.clip_rect().bottom() - ui.cursor().top() - 12.0).clamp(240.0, 1400.0),
             ),
             egui::Sense::drag(),
         );
@@ -471,6 +576,7 @@ impl Volume {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
+        renderer.show_lines = self.show_lines;
         if self.dirty {
             if let Some(result) = &self.result {
                 renderer.upload(&result.scene);
@@ -516,7 +622,7 @@ impl Volume {
         );
         let camera = projection * rotation * glam::Mat4::from_translation(-center);
         let now = ui.input(|i| i.time);
-        if self.animate && self.result.is_some() {
+        if self.show_lines && self.animate && self.result.is_some() {
             self.clock += self
                 .last_frame
                 .map_or(0.0, |last| (now - last).clamp(0.0, 0.1));

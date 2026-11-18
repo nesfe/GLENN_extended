@@ -20,6 +20,9 @@ pub struct Config {
     pub resolution: Resolution,
     pub speed: f64,
     pub density: f64,
+    /// Free-stream Kelvin for compressible dry air. Older cases use kinematic pressure.
+    #[serde(default)]
+    pub air_temperature: Option<f64>,
     pub kinematic_viscosity: f64,
     pub alpha_degrees: f64,
     pub iterations: usize,
@@ -33,6 +36,7 @@ impl Default for Config {
             resolution: Resolution::Preview,
             speed: 20.0,
             density: 1.225,
+            air_temperature: None,
             kinematic_viscosity: 1.5e-5,
             alpha_degrees: 0.0,
             iterations: 500,
@@ -41,9 +45,40 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn sound_speed(temperature: f64) -> f64 {
+        (1.4 * Self::GAS_CONSTANT * temperature).sqrt()
+    }
+    const GAS_CONSTANT: f64 = 8314.46261815324 / 28.97;
+    pub fn reference_pressure(&self) -> Option<f64> {
+        self.air_temperature
+            .map(|t| self.density * Self::GAS_CONSTANT * t)
+    }
+    pub fn gauge_pressure(&self, p: f64) -> f64 {
+        self.reference_pressure()
+            .map_or(p * self.density, |reference| p - reference)
+    }
+    pub fn solver(&self) -> &'static str {
+        match (
+            self.air_temperature.is_some(),
+            self.model == FlowModel::UnsteadyRans,
+        ) {
+            (false, false) => "simpleFoam",
+            (false, true) => "pimpleFoam",
+            (true, false) => "rhoSimpleFoam",
+            (true, true) => "rhoPimpleFoam",
+        }
+    }
     pub fn validate(&self) -> Result<(), String> {
+        let max_speed = if let Some(t) = self.air_temperature {
+            if !t.is_finite() || !(150.0..=500.0).contains(&t) {
+                return Err("Температура воздуха должна быть от 150 до 500 К".into());
+            }
+            0.95 * Self::sound_speed(t)
+        } else {
+            100.0
+        };
         for (name, x, lo, hi) in [
-            ("Скорость, м/с", self.speed, 0.001, 100.0),
+            ("Скорость, м/с", self.speed, 0.001, max_speed),
             ("Плотность, кг/м³", self.density, 0.001, 20000.0),
             (
                 "Кинематическая вязкость, м²/с",
@@ -62,6 +97,17 @@ impl Config {
             return Err("Число итераций: 10…100000".into());
         }
         Ok(())
+    }
+    pub fn coefficients(&self, force: DVec3, area: f64) -> Option<(f64, f64)> {
+        if !area.is_finite() || area <= 0. {
+            return None;
+        }
+        let (s, c) = self.alpha_degrees.to_radians().sin_cos();
+        let qa = 0.5 * self.density * self.speed.powi(2) * area;
+        Some((
+            (-s * force.x + c * force.y) / qa,
+            (c * force.x + s * force.y) / qa,
+        ))
     }
     pub fn velocity(&self) -> DVec3 {
         let a = self.alpha_degrees.to_radians();
@@ -233,17 +279,67 @@ mergeTolerance 1e-6;
                 &format!("type freestreamVelocity; freestreamValue uniform {u};"),
             ),
     )?;
+    let reference_pressure = cfg.reference_pressure().unwrap_or(0.0);
+    let transient_gas = cfg.air_temperature.is_some() && cfg.model == FlowModel::UnsteadyRans;
+    let pressure_dims = if cfg.air_temperature.is_some() {
+        "1 -1 -2"
+    } else {
+        "0 2 -2"
+    };
+    let far_pressure =
+        format!("type freestreamPressure; freestreamValue uniform {reference_pressure};");
+    let out_pressure = if transient_gas {
+        format!(
+            "type waveTransmissive; field p; psi thermo:psi; gamma 1.4; fieldInf {reference_pressure}; lInf {l}; value uniform {reference_pressure};"
+        )
+    } else {
+        far_pressure.clone()
+    };
     write(
         dir,
         "0/p",
         header("volScalarField", "p")
-            + "dimensions [0 2 -2 0 0 0 0]; internalField uniform 0;\n"
-            + &boundary(
-                "type zeroGradient;",
-                "type freestreamPressure; freestreamValue uniform 0;",
-                "type freestreamPressure; freestreamValue uniform 0;",
-            ),
+            + &format!(
+                "dimensions [{pressure_dims} 0 0 0 0]; internalField uniform {reference_pressure};\n"
+            )
+            + &boundary("type zeroGradient;", &far_pressure, &out_pressure),
     )?;
+    if let Some(t) = cfg.air_temperature {
+        let far_t = format!("type inletOutlet; inletValue uniform {t}; value uniform {t};");
+        write(
+            dir,
+            "0/T",
+            header("volScalarField", "T")
+                + &format!("dimensions [0 0 0 1 0 0 0]; internalField uniform {t};\n")
+                + &boundary("type zeroGradient;", &far_t, &far_t),
+        )?;
+        write(
+            dir,
+            "constant/thermophysicalProperties",
+            header("dictionary", "thermophysicalProperties")
+                + &format!(
+                    "thermoType {{ type hePsiThermo; mixture pureMixture; transport const; thermo hConst; equationOfState perfectGas; specie specie; energy sensibleInternalEnergy; }}\nmixture {{ specie {{ molWeight 28.97; }} thermodynamics {{ Cp {}; Hf 0; }} transport {{ mu {}; Pr 0.72; }} }}",
+                    3.5 * Config::GAS_CONSTANT,
+                    cfg.density * cfg.kinematic_viscosity
+                ),
+        )?;
+        let wall = if cfg.model == FlowModel::Laminar {
+            "type calculated; value uniform 0;"
+        } else {
+            "type compressible::alphatWallFunction; value uniform 0;"
+        };
+        write(
+            dir,
+            "0/alphat",
+            header("volScalarField", "alphat")
+                + "dimensions [1 -1 -1 0 0 0 0]; internalField uniform 0;\n"
+                + &boundary(
+                    wall,
+                    "type calculated; value uniform 0;",
+                    "type calculated; value uniform 0;",
+                ),
+        )?;
+    }
     if cfg.model != FlowModel::Laminar {
         let k = 1.5 * (0.01 * cfg.speed).powi(2);
         let omega = k.sqrt() / (0.09_f64.powf(0.25) * 0.07 * l);
@@ -267,20 +363,38 @@ mergeTolerance 1e-6;
         }
     }
     let transient = cfg.model == FlowModel::UnsteadyRans;
-    let solver = if transient {
-        "pimpleFoam"
+    let solver = cfg.solver();
+    let force_density = if cfg.air_temperature.is_some() {
+        "rho"
     } else {
-        "simpleFoam"
+        "rhoInf"
+    };
+    let energy_schemes = if cfg.air_temperature.is_some() {
+        "div(phi,e) Gauss limitedLinear 1; div(phi,K) Gauss upwind; div(phi,Ekp) Gauss upwind; div(phid,p) Gauss upwind; div(phiv,p) Gauss upwind; div((phi|interpolate(rho)),p) Gauss upwind; div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;"
+    } else {
+        ""
     };
     let end = if transient {
         cfg.transit_times * l / cfg.speed
     } else {
         cfg.iterations as f64
     };
+    let convective_dt = l / cfg.speed;
+    let max_dt = if let Some(t) = cfg.air_temperature {
+        (0.20 * base_cell / 2.0_f64.powi(refinement as i32) / (cfg.speed + Config::sound_speed(t)))
+            .min(convective_dt * 0.02)
+    } else {
+        convective_dt * 0.02
+    };
     let dt = if transient {
-        l / cfg.speed * 0.002
+        (convective_dt * 0.002).min(max_dt)
     } else {
         1.0
+    };
+    let advective_scheme = if cfg.air_temperature.is_some() && transient {
+        "Gauss limitedLinearV 1"
+    } else {
+        "bounded Gauss linearUpwind grad(U)"
     };
     let write_control = if transient {
         "adjustableRunTime"
@@ -304,13 +418,13 @@ purgeWrite 2; writeFormat ascii; writePrecision 10; writeCompression off;
 timeFormat general; timePrecision 8; runTimeModifiable false;
 adjustTimeStep {}; maxCo 0.5; maxDeltaT {};
 functions {{
- loads {{ type forces; libs ("libforces.so"); patches (body); rho rhoInf; rhoInf {}; CofR {}; log true; writeControl timeStep; writeInterval 1; }}
+ loads {{ type forces; libs ("libforces.so"); patches (body); rho {force_density}; rhoInf {}; pRef {reference_pressure}; CofR {}; log true; writeControl timeStep; writeInterval 1; }}
  vort {{ type vorticity; libs ("libfieldFunctionObjects.so"); field U; result vorticity; executeControl writeTime; writeControl writeTime; }}
  yPlus {{ type yPlus; libs ("libfieldFunctionObjects.so"); executeControl writeTime; writeControl writeTime; }}
 }}
 "#,
                 if transient { "true" } else { "false" },
-                l / cfg.speed * 0.02,
+                max_dt,
                 cfg.density,
                 vec(center)
             ),
@@ -323,7 +437,7 @@ functions {{
                 r#"
 ddtSchemes {{ default {}; }}
 gradSchemes {{ default cellLimited Gauss linear 1; }}
-divSchemes {{ default none; div(phi,U) bounded Gauss linearUpwind grad(U); div(phi,k) bounded Gauss upwind; div(phi,omega) bounded Gauss upwind; div((nuEff*dev2(T(grad(U))))) Gauss linear; }}
+divSchemes {{ default none; {energy_schemes} div(phi,U) {advective_scheme}; div(phi,k) bounded Gauss upwind; div(phi,omega) bounded Gauss upwind; div((nuEff*dev2(T(grad(U))))) Gauss linear; }}
 laplacianSchemes {{ default Gauss linear limited 0.5; }}
 interpolationSchemes {{ default linear; }}
 snGradSchemes {{ default limited 0.5; }}
@@ -332,21 +446,33 @@ wallDist {{ method meshWave; }}
                 if transient { "Euler" } else { "steadyState" }
             ),
     )?;
+    let pressure_controls = if cfg.air_temperature.is_some() {
+        "consistent no; pMinFactor 0.1; pMaxFactor 2.0;"
+    } else {
+        "consistent yes;"
+    };
+    let relaxation = if cfg.air_temperature.is_some() && transient {
+        "equations { \".*\" 1; }"
+    } else if cfg.air_temperature.is_some() {
+        "fields { p 0.45; rho 0.02; } equations { U 0.3; e 0.5; k 0.5; omega 0.5; }"
+    } else {
+        "fields { p 0.3; } equations { U 0.7; k 0.7; omega 0.7; }"
+    };
     write(
         dir,
         "system/fvSolution",
         header("dictionary", "fvSolution")
-            + r#"
+            + &r#"
 solvers {
  p { solver GAMG; tolerance 1e-8; relTol 0.05; smoother GaussSeidel; }
  pFinal { $p; relTol 0; }
- "(U|k|omega)" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0.1; }
- "(U|k|omega)Final" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0; }
+ "(rho|U|k|omega|e)" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0.1; }
+ "(rho|U|k|omega|e)Final" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0; }
 }
-SIMPLE { nNonOrthogonalCorrectors 1; consistent yes; residualControl { p 1e-5; U 1e-6; "(k|omega)" 1e-6; } }
+SIMPLE { nNonOrthogonalCorrectors 1; $PRESSURE_CONTROL residualControl { p 1e-5; U 1e-6; "(k|omega|e)" 1e-6; } }
 PIMPLE { nOuterCorrectors 2; nCorrectors 2; nNonOrthogonalCorrectors 1; }
-relaxationFactors { fields { p 0.3; } equations { U 0.7; k 0.7; omega 0.7; } }
-"#,
+relaxationFactors { $RELAXATION }
+"#.replace("$PRESSURE_CONTROL",pressure_controls).replace("$RELAXATION",relaxation),
     )?;
     // Sample a regular cloud for a shared 3D interpolator and slice display.
     // Fluid cells outside mesh and inside solids remain explicitly missing.
@@ -398,7 +524,9 @@ relaxationFactors { fields { p 0.3; } equations { U 0.7; k 0.7; omega 0.7; } }
 functions {{ sample {{ type sets; libs ("libsampling.so"); writeControl writeTime;
 setFormat raw; interpolationScheme cellPoint; fields (U p vorticity);
 sets (volume {{ type cloud; axis xyz; points ({locations}); }});
-}} }}
+}}
+wallPressure {{ type surfaces; libs ("libsampling.so"); writeControl writeTime; surfaceFormat raw; fields (p); surfaces ( body {{ type patch; patches (body); interpolate false; }} ); }}
+}}
 "#
             ),
     )?;

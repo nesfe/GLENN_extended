@@ -138,6 +138,7 @@ pub struct Tunnel {
     pub grid: Option<std::sync::Arc<glenn_extended::physics::flow::SectionGrid>>,
     pub pending_scene: Option<super::render::Scene>,
     pub viscous: bool,
+    pub field: Option<std::sync::Arc<glenn_solver_native::Snapshot>>,
     pub busy: bool,
     #[cfg(test)]
     pub viewport: Option<egui::Rect>,
@@ -180,7 +181,9 @@ pub fn show(
         .small()
         .color(MUTED),
     );
-    let message = if analysis.current.mach > 0.75 {
+    let message = if viscous && analysis.current.mach > 0.3 {
+        "Сжимаемое сечение · малиновым показано обратное течение · крутка в поле сечения не учитывается."
+    } else if analysis.current.mach > 0.75 {
         "Этот режим не рассчитывает ударные волны."
     } else if viscous {
         "Поле корневого сечения применяется по размаху; малиновым — область обратного течения."

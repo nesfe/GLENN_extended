@@ -322,15 +322,40 @@ impl Workbench {
         let Some(grid) = &self.tunnel.grid else {
             return;
         };
+        use glenn_extended::physics::flow::SectionField;
+        let section =
+            self.tunnel.field.as_ref().map(|f| {
+                glenn_extended::viscous::Section::new(f.clone(), self.analysis.state.alpha)
+            });
         let field = glenn_extended::physics::flow::FlowField {
             analysis: &self.analysis,
             grid,
-            viscous: None,
+            viscous: section.as_ref().map(|s| s as &dyn SectionField),
         };
         let Some(probe) = probe::sample(&field, self.view.probe_position) else {
             ui.colored_label(AMBER, "Зонд внутри крыла: измерение потока недоступно.");
             return;
         };
+        if let Some(section) = section {
+            let world =
+                glam::DVec3::from_array(self.view.probe_position) * self.analysis.state.chord;
+            ui.label(format!(
+                "Скорость из поля линий тока · {:.2} м/с",
+                probe.speed
+            ));
+            if world.z.abs() <= 0.5 * self.analysis.state.span {
+                let local =
+                    glenn_extended::geometry::SectionFrame::at(&self.analysis.state, world.z)
+                        .to_section(world);
+                if let Some(cp) = section.pressure_coefficient(local) {
+                    ui.label(format!(
+                        "Избыточное давление сечения · {:.2} Па",
+                        cp * self.analysis.atmosphere.dynamic_pressure
+                    ));
+                }
+            }
+            return;
+        }
         ui.label(format!(
             "V = {:.1} м/с   M = {:.3}   ps = {:.0} Па   pt = {:.0} Па   q = {:.0} Па",
             probe.speed,
@@ -400,7 +425,7 @@ impl Workbench {
         for (title, text) in [
             (
                 "Встроенная вязкая труба",
-                "В обычной вкладке работает нестационарный двумерный решатель D2Q9: поле скорости, давления и обратное течение обновляются в фоне без OpenFOAM. Силы сечения определяются обменом импульсом со стенкой. Режим 3D показывает крыло и рассчитанный корневой срез. Подробности уравнений и проверок: docs/NATIVE_FLOW.md.",
+                "В обычной вкладке работает нестационарный двумерный решатель (D2Q9 до M=0,3, сжимаемые уравнения Навье–Стокса для газа выше этого порога): поле скорости, давления и обратное течение обновляются в фоне без OpenFOAM. Силы сечения определяются потоком импульса на стенке. Режим 3D показывает крыло и рассчитанный корневой срез. Подробности уравнений и проверок: docs/NATIVE_FLOW.md.",
             ),
             (
                 "Панельное ядро",

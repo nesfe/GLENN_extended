@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 
-TOOLS = ('blockMesh', 'snappyHexMesh', 'checkMesh', 'simpleFoam', 'pimpleFoam', 'postProcess')
+TOOLS = ('blockMesh', 'snappyHexMesh', 'checkMesh', 'simpleFoam', 'pimpleFoam', 'rhoSimpleFoam', 'rhoPimpleFoam', 'postProcess')
 # libc and the ELF loader belong to the supported OS; everything else travels
 # with the solver, including transitive and dynamically loaded libraries.
 GLIBC = re.compile(r'^(?:ld-linux|lib(?:c|m|pthread|dl|rt|resolv|util)\.so)')

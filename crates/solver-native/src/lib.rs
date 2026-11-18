@@ -1,6 +1,7 @@
 //! Progressive two-dimensional viscous flow. D2Q9 with regularized collision,
 //! local Smagorinsky stress and stationary halfway bounce-back walls.
 //! No prescribed separation point, circulation, wake, or lift curve.
+mod compressible;
 pub mod worker;
 
 use glenn_core::{geometry::Airfoil, model::Point};
@@ -37,6 +38,9 @@ pub struct Config {
     pub reynolds: f64,
     pub alpha: f64,
     pub contour: Vec<Point>,
+    /// Physical free-stream Mach number; zero selects the low-Mach lattice.
+    pub mach: f64,
+    pub gamma: f64,
 }
 /// The Reynolds number this many cells per chord can honestly carry. The wall
 /// is a staircase of whole cells, so unless the boundary layer is several
@@ -50,6 +54,23 @@ pub fn resolved_reynolds(chord_cells: usize) -> f64 {
 }
 
 impl Config {
+    pub fn gas_section(
+        foil: &Airfoil,
+        alpha: f64,
+        reynolds: f64,
+        chord_cells: usize,
+        mach: f64,
+        gamma: f64,
+    ) -> Self {
+        let mut config = Self::airfoil(foil, alpha, reynolds, chord_cells);
+        if mach > 0.3 {
+            config.reynolds = reynolds;
+            config.mach = mach;
+            config.gamma = gamma;
+        }
+        config
+    }
+
     /// Reynolds is capped at what the grid resolves; the caller keeps the
     /// flight value for display and must not present this as that flow.
     pub fn airfoil(foil: &Airfoil, alpha: f64, reynolds: f64, chord_cells: usize) -> Self {
@@ -58,6 +79,8 @@ impl Config {
             alpha,
             reynolds: reynolds.min(resolved_reynolds(chord_cells)),
             chord_cells,
+            mach: 0.0,
+            gamma: 1.4,
         }
     }
 }
@@ -118,28 +141,81 @@ impl Snapshot {
         path
     }
     pub fn sample(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        self.interpolate(x, y, |i| self.velocity[i])
+    }
+    pub fn pressure_at(&self, x: f32, y: f32) -> Option<f32> {
+        Some(self.interpolate(x, y, |i| [self.pressure[i]])?[0])
+    }
+    fn interpolate<const N: usize>(
+        &self,
+        x: f32,
+        y: f32,
+        values: impl Fn(usize) -> [f32; N],
+    ) -> Option<[f32; N]> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
         let gx = (x + 1.5) * self.cells_per_chord - 0.5;
         let gy = (y + 2.0) * self.cells_per_chord - 0.5;
         if gx < 0.0 || gy < 0.0 || gx >= (self.width - 1) as f32 || gy >= (self.height - 1) as f32 {
             return None;
         }
         let (ix, iy) = (gx as usize, gy as usize);
-        let mut u = [0.0; 2];
+        let mut u = [0.0; N];
         for (dx, wx) in [(0, 1.0 - gx.fract()), (1, gx.fract())] {
             for (dy, wy) in [(0, 1.0 - gy.fract()), (1, gy.fract())] {
                 let i = (iy + dy) * self.width + ix + dx;
                 if self.solid[i] {
                     return None;
                 }
-                u[0] += wx * wy * self.velocity[i][0];
-                u[1] += wx * wy * self.velocity[i][1];
+                for (dest, v) in u.iter_mut().zip(values(i)) {
+                    *dest += wx * wy * v;
+                }
             }
         }
         Some(u)
     }
 }
 
-pub struct Solver {
+/// Both engines publish velocities in U_inf and pressure as Cp.
+pub enum Solver {
+    Lattice(Lattice),
+    Compressible(compressible::Compressible),
+}
+impl Solver {
+    pub fn new(config: Config) -> Result<Self, String> {
+        if !config.mach.is_finite()
+            || config.mach < 0.0
+            || !config.gamma.is_finite()
+            || !(1.0..=2.0).contains(&config.gamma)
+            || config.gamma == 1.0
+        {
+            return Err("Недопустимые параметры газа".into());
+        }
+        let lattice = Lattice::new(config)?;
+        if lattice.config.mach > 0.3 {
+            Ok(Self::Compressible(compressible::Compressible::new(
+                lattice,
+            )?))
+        } else {
+            Ok(Self::Lattice(lattice))
+        }
+    }
+    pub fn advance(&mut self, count: usize) -> Result<(), String> {
+        match self {
+            Self::Lattice(s) => s.advance(count),
+            Self::Compressible(s) => s.advance(count),
+        }
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        match self {
+            Self::Lattice(s) => s.snapshot(),
+            Self::Compressible(s) => s.snapshot(),
+        }
+    }
+}
+
+pub struct Lattice {
     config: Config,
     width: usize,
     height: usize,
@@ -148,6 +224,7 @@ pub struct Solver {
     solid: Vec<bool>,
     /// Index of the upstream cell for each streaming direction; MAX means wall.
     source: Vec<[usize; 9]>,
+    regular: Vec<bool>,
     step: u64,
     force: [f32; 2],
     periodic: bool,
@@ -176,7 +253,7 @@ fn inside(p: [f64; 2], contour: &[[f64; 2]]) -> bool {
     }
     result
 }
-impl Solver {
+impl Lattice {
     pub fn new(config: Config) -> Result<Self, String> {
         if !(24..=96).contains(&config.chord_cells)
             || !config.reynolds.is_finite()
@@ -216,7 +293,7 @@ impl Solver {
         if !config.contour.is_empty() && !solid.iter().any(|&cell| cell) {
             return Err("Профиль тоньше ячейки. Увеличьте разрешение сетки.".into());
         }
-        let source = (0..width * height)
+        let source: Vec<[usize; 9]> = (0..width * height)
             .map(|i| {
                 std::array::from_fn(|q| {
                     let x = (i % width) as i32 - C[q][0];
@@ -237,6 +314,19 @@ impl Solver {
             populations: vec![initial; width * height],
             next: vec![initial; width * height],
             solid,
+            regular: source
+                .iter()
+                .enumerate()
+                .map(|(i, links)| {
+                    let x = i % width;
+                    let y = i / width;
+                    x > 0
+                        && x + 1 < width
+                        && y > 0
+                        && y + 1 < height
+                        && !links.contains(&usize::MAX)
+                })
+                .collect(),
             source,
             step: 0,
             force: [0.0; 2],
@@ -266,17 +356,36 @@ impl Solver {
                         self.next[i] = self.populations[i - 1];
                         continue;
                     }
-                    let mut f = [0.0; 9];
-                    for q in 0..9 {
-                        let j = self.source[i][q];
-                        if j == usize::MAX {
-                            f[q] = self.populations[i][OPP[q]];
-                            force[0] -= 2.0 * f[q] * C[q][0] as f32;
-                            force[1] -= 2.0 * f[q] * C[q][1] as f32;
-                        } else {
-                            f[q] = self.populations[j][q];
+                    let f = if self.regular[i] {
+                        // Fixed D2Q9 stencil in the fluid interior. Indirect
+                        // lookups and reflected populations are needed at walls only.
+                        let p = &self.populations;
+                        let w = self.width;
+                        [
+                            p[i][0],
+                            p[i - 1][1],
+                            p[i - w][2],
+                            p[i + 1][3],
+                            p[i + w][4],
+                            p[i - w - 1][5],
+                            p[i - w + 1][6],
+                            p[i + w + 1][7],
+                            p[i + w - 1][8],
+                        ]
+                    } else {
+                        let mut f = [0.0; 9];
+                        for q in 0..9 {
+                            let j = self.source[i][q];
+                            if j == usize::MAX {
+                                f[q] = self.populations[i][OPP[q]];
+                                force[0] -= 2.0 * f[q] * C[q][0] as f32;
+                                force[1] -= 2.0 * f[q] * C[q][1] as f32;
+                            } else {
+                                f[q] = self.populations[j][q];
+                            }
                         }
-                    }
+                        f
+                    };
                     let rho: f32 = f.iter().sum();
                     let u = [
                         (f[1] - f[3] + f[5] - f[6] - f[7] + f[8]) / rho,
@@ -384,11 +493,13 @@ mod tests {
     }
     #[test]
     fn uniform_flow_preserves_mass_and_velocity() {
-        let mut s = Solver::new(Config {
+        let mut s = Lattice::new(Config {
             chord_cells: 24,
             reynolds: 1000.0,
             alpha: 0.0,
             contour: vec![],
+            mach: 0.0,
+            gamma: 1.4,
         })
         .unwrap();
         s.advance(400).unwrap();
@@ -403,11 +514,13 @@ mod tests {
     }
     #[test]
     fn shear_wave_decays_at_the_prescribed_viscosity() {
-        let mut s = Solver::new(Config {
+        let mut s = Lattice::new(Config {
             chord_cells: 24,
             reynolds: 30.0,
             alpha: 0.0,
             contour: vec![],
+            mach: 0.0,
+            gamma: 1.4,
         })
         .unwrap();
         s.periodic = true;

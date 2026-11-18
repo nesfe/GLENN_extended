@@ -90,13 +90,13 @@ impl VolumeField {
         // over the farfield passed metres above/below thin wings.
         let extent = hi - lo;
         let pad_y = (extent.y * 0.25).max(extent.x * 0.08);
-        for z in 0..9 {
-            for y in 0..21 {
+        for z in 0..7 {
+            for y in 0..7 {
                 let seed = DVec3::new(
                     self.min.x + (self.max.x - self.min.x) * 0.02,
-                    (lo.y - pad_y + (extent.y + 2.0 * pad_y) * y as f64 / 20.0)
+                    (lo.y - pad_y + (extent.y + 2.0 * pad_y) * y as f64 / 6.0)
                         .clamp(self.min.y + step, self.max.y - step),
-                    (lo.z + extent.z * (z as f64 + 0.5) / 9.0)
+                    (lo.z + extent.z * (z as f64 + 0.5) / 7.0)
                         .clamp(self.min.z + step, self.max.z - step),
                 );
                 seeds.push(seed);
@@ -247,6 +247,61 @@ pub fn read_field(case: &Path, density: f64) -> Result<VolumeField, String> {
     }
     Ok(result)
 }
+/// Pressure at the centres of the CFD wall faces, optional in older cases.
+pub(crate) fn wall_pressure(
+    case: &Path,
+    time: f64,
+    cfg: &crate::Config,
+) -> Result<Vec<(DVec3, f64)>, String> {
+    let root = case.join("postProcessing/wallPressure");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let (t, dir) = latest(&root)?;
+    if (t - time).abs() > 1e-5 * time.abs().max(1.0) {
+        return Err("Давление на стенке и поле относятся к разным шагам".into());
+    }
+    let data = fs::read_to_string(dir.join("p_body.raw")).map_err(|e| e.to_string())?;
+    data.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| {
+            let mut words = l.split_whitespace();
+            let mut number = || {
+                words
+                    .next()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|x| x.is_finite())
+                    .ok_or_else(|| "Повреждённое давление стенки".to_owned())
+            };
+            let pos = DVec3::new(number()?, number()?, number()?);
+            let gauge = cfg.gauge_pressure(number()?);
+            Ok((pos, gauge))
+        })
+        .collect()
+}
+
+/// OpenFOAM records min, max and area average for each patch.
+pub(crate) fn wall_y_plus(case: &Path, time: f64) -> Option<[f64; 3]> {
+    let (_, dir) = latest(&case.join("postProcessing/yPlus")).ok()?;
+    let records = fs::read_to_string(dir.join("yPlus.dat")).ok()?;
+    records.lines().rev().find_map(|l| {
+        let mut row = l.split_whitespace();
+        let t = row.next()?.parse::<f64>().ok()?;
+        if (t - time).abs() > 1e-5 * time.abs().max(1.0) || row.next()? != "body" {
+            return None;
+        }
+        let values: [f64; 3] = [
+            row.next()?.parse().ok()?,
+            row.next()?.parse().ok()?,
+            row.next()?.parse().ok()?,
+        ];
+        values
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.)
+            .then_some(values)
+    })
+}
+
 pub(crate) fn loads(case: &Path) -> Result<Vec<(f64, DVec3)>, String> {
     let (_, dir) = latest(&case.join("postProcessing/loads"))?;
     let modern = dir.join("force.dat");

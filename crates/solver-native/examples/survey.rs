@@ -9,11 +9,13 @@ fn main() {
         camber: 0.0,
         ..Simulation::default()
     };
-    let mut solver = Solver::new(Config::airfoil(
+    let mut solver = Solver::new(Config::gas_section(
         &Airfoil::generate(&state),
         alpha,
         re,
         cells,
+        args.get(5).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        1.4,
     ))
     .unwrap();
     let start = std::time::Instant::now();

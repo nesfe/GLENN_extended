@@ -20,6 +20,9 @@ pub struct Backend {
 pub struct RunResult {
     pub field: VolumeField,
     pub force: DVec3,
+    pub wall_pressure: Vec<(DVec3, f64)>,
+    pub wall_faces: usize,
+    pub wall_y_plus: Option<[f64; 3]>,
     pub force_history: Vec<(f64, DVec3)>,
     /// Initial equation residual at the first solve of each time step.
     pub residuals: [Vec<(f64, f64)>; 4],
@@ -275,11 +278,7 @@ pub fn run(
             case.join("log.checkMesh").display()
         ));
     }
-    let solver = if cfg.model == FlowModel::UnsteadyRans {
-        "pimpleFoam"
-    } else {
-        "simpleFoam"
-    };
+    let solver = cfg.solver();
     stage(backend, case, solver, &[], token, progress)?;
     stage(
         backend,
@@ -335,18 +334,17 @@ fn residual_history(log: &str, end: f64) -> [Vec<(f64, f64)>; 4] {
 }
 /// Reopen a completed case without rerunning or mixing it with current inputs.
 pub fn load_result(case: &Path) -> Result<RunResult, String> {
-    body_faces(case)?;
+    let wall_faces = body_faces(case)?;
     let cfg: Config = serde_json::from_str(
         &fs::read_to_string(case.join("glenn-case.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     cfg.validate()?;
-    let solver = if cfg.model == FlowModel::UnsteadyRans {
-        "pimpleFoam"
-    } else {
-        "simpleFoam"
-    };
-    let field = read_field(case, cfg.density)?;
+    let solver = cfg.solver();
+    let mut field = read_field(case, 1.0)?;
+    for p in field.pressure.iter_mut().flatten() {
+        *p = cfg.gauge_pressure(*p);
+    }
     let force_history = crate::field::loads(case)?;
     let &(force_time, force) = force_history.last().ok_or("Нет истории сил")?;
     if (force_time - field.time).abs() > 1e-5 * field.time.abs().max(1.0) {
@@ -366,6 +364,9 @@ pub fn load_result(case: &Path) -> Result<RunResult, String> {
     };
     let streamlines = field.streamlines_around(bounds);
     Ok(RunResult {
+        wall_faces,
+        wall_pressure: crate::field::wall_pressure(case, field.time, &cfg)?,
+        wall_y_plus: crate::field::wall_y_plus(case, field.time),
         field,
         force,
         force_history,

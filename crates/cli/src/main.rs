@@ -15,7 +15,7 @@ fn execute() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "--help") {
         println!(
-            "glenn-cfd MODEL.stl --case NEW_DIRECTORY [--units m|mm|cm] [--mode laminar|rans|urans] [--quality preview|standard|fine] [--speed M/S] [--nu M2/S] [--density KG/M3] [--alpha DEG] [--iterations N] [--time L/V] [--bashrc PATH] [--wsl]"
+            "glenn-cfd MODEL.stl --case NEW_DIRECTORY [--units m|mm|cm] [--mode laminar|rans|urans] [--quality preview|standard|fine] [--speed M/S] [--air-temperature K] [--nu M2/S] [--density KG/M3] [--alpha DEG] [--iterations N] [--time L/V] [--bashrc PATH] [--wsl]"
         );
         return Ok(());
     }
@@ -82,6 +82,7 @@ fn execute() -> Result<(), String> {
             }
             "--speed" => cfg.speed = number()?,
             "--nu" => cfg.kinematic_viscosity = number()?,
+            "--air-temperature" => cfg.air_temperature = Some(number()?),
             "--density" => cfg.density = number()?,
             "--alpha" => cfg.alpha_degrees = number()?,
             "--time" => cfg.transit_times = number()?,

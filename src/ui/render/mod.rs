@@ -45,6 +45,7 @@ pub struct Renderer {
     line_pipeline: wgpu::RenderPipeline,
     lines: Option<wgpu::Buffer>,
     line_capacity: u64,
+    pub show_lines: bool,
     line_count: u32,
     uniform: wgpu::Buffer,
     binding: wgpu::BindGroup,
@@ -161,6 +162,7 @@ impl Renderer {
             line_pipeline: pipeline(true, true),
             lines: None,
             line_capacity: 0,
+            show_lines: true,
             line_count: 0,
             state,
             uniform,
@@ -327,7 +329,9 @@ impl Renderer {
                 pass.set_pipeline(&self.transparent);
                 pass.draw(self.solid_count..self.total_count, 0..1);
             }
-            if let Some(lines) = &self.lines {
+            if self.show_lines
+                && let Some(lines) = &self.lines
+            {
                 pass.set_bind_group(0, &self.binding, &[]);
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_vertex_buffer(0, lines.slice(..));

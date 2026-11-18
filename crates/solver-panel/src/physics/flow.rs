@@ -166,6 +166,7 @@ pub trait SectionField: Sync {
     /// Section-frame velocity over free-stream speed, or None outside the
     /// computed box and inside the body.
     fn sample(&self, point: Point) -> Option<Point>;
+    fn pressure_coefficient(&self, point: Point) -> Option<f64>;
     /// How much of that solution applies here: one well inside the computed
     /// box, fading to zero at its edge so the surrounding potential field
     /// joins onto it without a step.
@@ -233,24 +234,26 @@ impl FlowField<'_> {
         let span_position = world.z.clamp(-state.span * 0.5, state.span * 0.5);
         let frame = SectionFrame::at(state, span_position);
         let local = frame.to_section(world);
-        let section_velocity = if state.profile_type == crate::model::Profile::Cylinder {
-            // The native solver holds its wall still, so it cannot carry the
-            // Magnus circulation a spinning cylinder needs.
-            super::panel::cylinder_velocity(local, frame.incidence, self.spin_ratio())
-        } else {
-            let potential = self
-                .grid
-                .velocity(&self.analysis.panel, local, frame.incidence);
-            match self
-                .viscous
-                .and_then(|v| Some((v.sample(local)?, v.weight(local))))
-            {
-                Some((viscous, weight)) => Point::new(
-                    potential.x + (viscous.x - potential.x) * weight,
-                    potential.y + (viscous.y - potential.y) * weight,
-                ),
-                None => potential,
+        let potential = || {
+            if state.profile_type == crate::model::Profile::Cylinder {
+                // The native solver holds its wall still, so it cannot carry the
+                // Magnus circulation a spinning cylinder needs.
+                super::panel::cylinder_velocity(local, frame.incidence, self.spin_ratio())
+            } else {
+                self.grid
+                    .velocity(&self.analysis.panel, local, frame.incidence)
             }
+        };
+        let section_velocity = match self
+            .viscous
+            .and_then(|field| Some((field.sample(local)?, field.weight(local))))
+        {
+            Some((u, 1.0)) => u,
+            Some((u, w)) => {
+                let p = potential();
+                Point::new(p.x + (u.x - p.x) * w, p.y + (u.y - p.y) * w)
+            }
+            None => potential(),
         };
         let mut velocity = frame.velocity_to_world(section_velocity);
         // Fade the 2D section's influence beyond the physical wing tips.

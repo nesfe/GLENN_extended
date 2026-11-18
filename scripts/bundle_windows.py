@@ -13,7 +13,7 @@ import time
 
 URL = 'https://dl.openfoam.com/source/v2412/OpenFOAM-v2412-windows-mingw.exe'
 SHA256 = '7c31c0526786307465cd34b4ac820530fbd52c31225d9b03713903a8f84a7028'
-TOOLS = ('blockMesh', 'snappyHexMesh', 'checkMesh', 'simpleFoam', 'pimpleFoam', 'postProcess')
+TOOLS = ('blockMesh', 'snappyHexMesh', 'checkMesh', 'simpleFoam', 'pimpleFoam', 'rhoSimpleFoam', 'rhoPimpleFoam', 'postProcess')
 
 
 def bundle(destination):

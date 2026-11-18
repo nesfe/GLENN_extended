@@ -56,6 +56,10 @@ impl SectionField for Section {
         ))
     }
 
+    fn pressure_coefficient(&self, p: Point) -> Option<f64> {
+        let (x, y) = self.to_lattice(p);
+        self.field.pressure_at(x as f32, y as f32).map(f64::from)
+    }
     fn weight(&self, point: Point) -> f64 {
         let (x, y) = self.to_lattice(point);
         let margin = (x + 1.5)

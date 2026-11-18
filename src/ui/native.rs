@@ -101,8 +101,10 @@ impl Native {
         let state = &analysis.state;
         if state.velocity <= 0.0 {
             Some("Скорость потока равна нулю.")
-        } else if analysis.current.mach > 0.3 {
-            Some("Вязкий решатель работает при M ≤ 0,3.")
+        } else if analysis.current.mach > 0.3
+            && state.planet == glenn_extended::model::Planet::Water
+        {
+            Some("Для сжимаемой воды требуется уравнение состояния жидкости.")
         } else if state.profile_type == glenn_extended::model::Profile::Cylinder
             && state.cylinder_rpm != 0.0
         {
@@ -112,22 +114,27 @@ impl Native {
         }
     }
 
+    fn field_config(analysis: &Analysis, cells: usize) -> Config {
+        let state = &analysis.state;
+        let re = state.velocity * state.chord * analysis.atmosphere.density
+            / analysis.atmosphere.viscosity;
+        Config::gas_section(
+            &analysis.foil,
+            state.alpha,
+            re,
+            cells,
+            analysis.current.mach,
+            analysis.atmosphere.gamma,
+        )
+    }
+
     pub fn snapshot_for(&self, analysis: &Analysis) -> Option<Arc<Snapshot>> {
         if Self::unavailable_reason(analysis).is_some() || self.error.is_some() {
             return None;
         }
-        let state = &analysis.state;
-        let re = state.velocity * state.chord * analysis.atmosphere.density
-            / analysis.atmosphere.viscosity;
-        (self.config.as_ref()
-            == Some(&Config::airfoil(
-                &analysis.foil,
-                state.alpha,
-                re,
-                self.cells,
-            )))
-        .then(|| self.snapshot.clone())
-        .flatten()
+        (self.config.as_ref() == Some(&Self::field_config(analysis, self.cells)))
+            .then(|| self.snapshot.clone())
+            .flatten()
     }
 
     pub fn export_csv(&self, analysis: &Analysis) -> Result<String, String> {
@@ -137,12 +144,23 @@ impl Native {
         let state = &analysis.state;
         let re = state.velocity * state.chord * analysis.atmosphere.density
             / analysis.atmosphere.viscosity;
-        if config != &Config::airfoil(&analysis.foil, state.alpha, re, self.cells) {
+        if config != &Self::field_config(analysis, self.cells) {
             return Err("Дождитесь поля для новых параметров".into());
         }
         let mut csv = format!(
-            "# Native D2Q9 root section; step={}; tU/c={}; Re={}; alpha={}; cl={}; cd={}\nx_m,y_m,Ux_m_s,Uy_m_s,p_minus_pinf_Pa,solid\n",
-            field.step, field.time, re, state.alpha, field.lift, field.drag
+            "# Native {} root section; step={}; tU/c={}; Re_sim={}; Re_flight={}; alpha={}; cl={}; cd={}\nx_m,y_m,Ux_m_s,Uy_m_s,p_minus_pinf_Pa,solid\n",
+            if config.mach > 0.3 {
+                "compressible NS"
+            } else {
+                "D2Q9"
+            },
+            field.step,
+            field.time,
+            config.reynolds,
+            re,
+            state.alpha,
+            field.lift,
+            field.drag
         );
         for y in 0..field.height {
             for x in 0..field.width {
@@ -280,9 +298,6 @@ impl Native {
     /// so the three-dimensional tunnel runs the same computation without the
     /// section view being open.
     pub fn advance(&mut self, analysis: &Analysis) -> Result<(), String> {
-        let state = &analysis.state;
-        let re = state.velocity * state.chord * analysis.atmosphere.density
-            / analysis.atmosphere.viscosity;
         if let Some(message) = Self::unavailable_reason(analysis) {
             self.suspend();
             self.config = None;
@@ -290,7 +305,7 @@ impl Native {
             self.error = Some(message.into());
             return Err(message.into());
         }
-        let config = Config::airfoil(&analysis.foil, state.alpha, re, self.cells);
+        let config = Self::field_config(analysis, self.cells);
         if self.config.as_ref() != Some(&config) {
             self.generation = self.worker.submit(config.clone());
             self.config = Some(config);
@@ -323,6 +338,9 @@ impl Native {
         analysis: &Analysis,
     ) {
         let f = &f;
+        if analysis.current.mach > 0.3 {
+            ui.label("Сжимаемое 2D-сечение · идеальный газ · вязкость и теплопроводность");
+        }
         let re = state.velocity * state.chord * analysis.atmosphere.density
             / analysis.atmosphere.viscosity;
         ui.horizontal_wrapped(|ui| {
@@ -332,7 +350,7 @@ impl Native {
             );
             ui.label(format!(
                 "Re расчёта = {:.0} · Re полёта = {re:.2e} · tU/c = {:.2} · {:.2} с",
-                glenn_solver_native::resolved_reynolds(self.cells).min(re),
+                self.config.as_ref().map_or(0.0, |c| c.reynolds),
                 f.time,
                 f.time * state.chord / state.velocity
             ));

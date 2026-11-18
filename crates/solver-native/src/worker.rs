@@ -44,7 +44,19 @@ impl Default for Worker {
                     solver = Some(Solver::new(config));
                 }
                 let result = match solver.as_mut().unwrap() {
-                    Ok(s) => s.advance(24).map(|()| Arc::new(s.snapshot())),
+                    Ok(s) => {
+                        // Bound latency for pause, replacement and publication on large grids.
+                        let started = std::time::Instant::now();
+                        (|| {
+                            for _ in 0..24 {
+                                s.advance(1)?;
+                                if started.elapsed() >= std::time::Duration::from_millis(40) {
+                                    break;
+                                }
+                            }
+                            Ok(Arc::new(s.snapshot()))
+                        })()
+                    }
                     Err(e) => Err(e.clone()),
                 };
                 let mut c = lock.lock().unwrap();
@@ -109,14 +121,18 @@ mod tests {
             reynolds: 100.0,
             alpha: 0.0,
             contour: vec![],
+            mach: 0.0,
+            gamma: 1.4,
         };
         worker.submit(config.clone());
-        config.alpha = 30.0;
+        config.chord_cells = 32;
         let latest = worker.submit(config);
         let start = std::time::Instant::now();
         loop {
             if let Some(result) = worker.poll(latest) {
-                assert!(result.unwrap().step >= 24);
+                let field = result.unwrap();
+                assert_eq!(field.cells_per_chord, 32.0);
+                assert!(field.step > 0);
                 break;
             }
             assert!(start.elapsed().as_secs() < 10);

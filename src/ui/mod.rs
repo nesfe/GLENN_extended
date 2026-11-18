@@ -8,6 +8,7 @@ mod plots;
 mod render;
 mod tunnel;
 mod volume;
+mod volume_compare;
 use crate::audio::TunnelAudio;
 use eframe::egui::{self, Color32, RichText, Vec2};
 use glenn_extended::{
@@ -341,7 +342,8 @@ impl Workbench {
                     self.performance = snapshot.performance;
                     self.tunnel.grid = snapshot.grid;
                     self.tunnel.pending_scene = snapshot.scene;
-                    self.tunnel.viscous = snapshot.viscous;
+                    self.tunnel.viscous = snapshot.field.is_some();
+                    self.tunnel.field = snapshot.field;
                 }
                 Err(error) => {
                     self.status = format!("Расчёт остановлен: {error}");
@@ -431,41 +433,45 @@ impl Workbench {
                         self.export("json");
                     }
                 });
-                ui.horizontal_wrapped(|ui| {
-                    egui::ComboBox::from_id_salt("presets")
-                        .width(ui.available_width().clamp(100.0, 380.0))
-                        .truncate()
-                        .selected_text(self.presets[self.preset].name.clone())
-                        .show_ui(ui, |ui| {
-                            for (i, preset) in self.presets.iter().enumerate() {
-                                if ui
-                                    .selectable_value(&mut self.preset, i, &preset.name)
-                                    .clicked()
-                                {
-                                    self.state = preset.state.clone();
+                if !self.volume_active() {
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::from_id_salt("presets")
+                            .width(ui.available_width().clamp(100.0, 380.0))
+                            .truncate()
+                            .selected_text(self.presets[self.preset].name.clone())
+                            .show_ui(ui, |ui| {
+                                for (i, preset) in self.presets.iter().enumerate() {
+                                    if ui
+                                        .selectable_value(&mut self.preset, i, &preset.name)
+                                        .clicked()
+                                    {
+                                        self.state = preset.state.clone();
+                                    }
                                 }
-                            }
-                        });
-                    if ui.button("Сбросить").clicked() {
-                        self.state = Simulation::default();
-                        self.view = tunnel::View::default();
-                        self.preset = 0;
-                    }
-                    let mut audio_enabled = self.audio.is_some();
-                    if ui.checkbox(&mut audio_enabled, "Звук").changed() {
-                        if audio_enabled {
-                            match TunnelAudio::start() {
-                                Ok(audio) => self.audio = Some(audio),
-                                Err(error) => self.status = error,
-                            }
-                        } else {
-                            self.audio = None;
+                            });
+                        if ui.button("Сбросить").clicked() {
+                            self.state = Simulation::default();
+                            self.view = tunnel::View::default();
+                            self.preset = 0;
                         }
-                    }
-                    if audio_enabled {
-                        ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).text("Громкость"));
-                    }
-                });
+                        let mut audio_enabled = self.audio.is_some();
+                        if ui.checkbox(&mut audio_enabled, "Звук").changed() {
+                            if audio_enabled {
+                                match TunnelAudio::start() {
+                                    Ok(audio) => self.audio = Some(audio),
+                                    Err(error) => self.status = error,
+                                }
+                            } else {
+                                self.audio = None;
+                            }
+                        }
+                        if audio_enabled {
+                            ui.add(
+                                egui::Slider::new(&mut self.volume, 0.0..=1.0).text("Громкость"),
+                            );
+                        }
+                    });
+                }
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
                     // Explicit indices: the section view was added last but
@@ -730,7 +736,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn unsupported_viscous_speed_keeps_the_tunnel_visible_without_input() {
+    fn compressible_viscous_speed_keeps_the_tunnel_visible_without_input() {
         fn has_title(shape: &egui::Shape) -> bool {
             match shape {
                 egui::Shape::Text(text) => text.galley.text().contains("Аэродинамическая труба"),
@@ -744,7 +750,7 @@ mod tests {
             velocity: 250.0,
             ..Simulation::default()
         });
-        assert!(app.analysis.current.mach > 0.3);
+        assert!(app.analysis.current.mach > 0.3 && app.viscous_active());
         for _ in 0..4 {
             let output = ctx.run(
                 egui::RawInput {
@@ -798,7 +804,7 @@ mod tests {
                 performance: flight::calculate(&analysis),
                 grid: None,
                 scene: None,
-                viscous: request.viscous.is_some(),
+                field: request.viscous,
             })
         });
         app.recalculate();

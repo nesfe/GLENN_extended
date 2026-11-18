@@ -8,13 +8,15 @@ use std::{
     process::Command,
 };
 
-pub const TOOLS: [&str; 6] = [
+pub const TOOLS: [&str; 8] = [
     "blockMesh",
     "snappyHexMesh",
     "checkMesh",
     "simpleFoam",
     "pimpleFoam",
     "postProcess",
+    "rhoSimpleFoam",
+    "rhoPimpleFoam",
 ];
 #[derive(Deserialize)]
 struct Manifest {

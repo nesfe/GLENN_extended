@@ -12,6 +12,28 @@ pub fn plot(
     series: &[(&str, &[Point], Color32)],
     invert_y: bool,
 ) {
+    draw(ui, title, x_label, y_label, series, invert_y, false)
+}
+pub fn scatter(ui: &mut egui::Ui, title: &str, x_label: &str, y_label: &str, points: &[Point]) {
+    draw(
+        ui,
+        title,
+        x_label,
+        y_label,
+        &[("Грани стенки", points, CYAN)],
+        true,
+        true,
+    )
+}
+fn draw(
+    ui: &mut egui::Ui,
+    title: &str,
+    x_label: &str,
+    y_label: &str,
+    series: &[(&str, &[Point], Color32)],
+    invert_y: bool,
+    scatter: bool,
+) {
     ui.label(egui::RichText::new(title).strong().size(16.0));
     ui.horizontal_wrapped(|ui| {
         for (name, _, color) in series {
@@ -97,7 +119,11 @@ pub fn plot(
             .filter(|p| p.x.is_finite() && p.y.is_finite())
             .map(|p| transform(*p))
             .collect();
-        if points.len() == 1 {
+        if scatter {
+            for point in points {
+                clipped.circle_filled(point, 1.6, *color);
+            }
+        } else if points.len() == 1 {
             clipped.circle_filled(points[0], 4.0, *color);
         } else {
             clipped.add(egui::Shape::line(points, Stroke::new(1.8, *color)));
