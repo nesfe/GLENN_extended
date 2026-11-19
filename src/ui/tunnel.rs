@@ -45,6 +45,24 @@ impl Default for View {
 }
 /// Shared pressure transfer function for surface colors and the legend.
 /// Neutral pressure is light; suction and overpressure remain distinguishable.
+pub(super) fn pressure_legend(painter: &egui::Painter, legend_start: egui::Pos2, palette: usize) {
+    for step in 0..100 {
+        let start = legend_start + Vec2::new(step as f32 * 1.3, 0.0);
+        painter.rect_filled(
+            egui::Rect::from_min_size(start, Vec2::new(1.5, 7.0)),
+            0,
+            color(-2.0 + step as f64 * 0.03, palette),
+        );
+    }
+    painter.text(
+        legend_start + Vec2::new(0.0, 13.0),
+        egui::Align2::LEFT_TOP,
+        "Cp  −2               0      +1",
+        egui::FontId::proportional(10.0),
+        MUTED,
+    );
+}
+
 pub(super) fn color(cp: f64, palette: usize) -> Color32 {
     let stops = match palette {
         1 => [
@@ -351,21 +369,10 @@ pub fn show(
         );
     }
     if view.pressure {
-        let legend_start = rect.right_top() + Vec2::new(-158.0, 18.0);
-        for step in 0..100 {
-            let start = legend_start + Vec2::new(step as f32 * 1.3, 0.0);
-            painter.rect_filled(
-                egui::Rect::from_min_size(start, Vec2::new(1.5, 7.0)),
-                0,
-                color(-2.0 + step as f64 * 0.03, view.palette),
-            );
-        }
-        painter.text(
-            legend_start + Vec2::new(0.0, 13.0),
-            egui::Align2::LEFT_TOP,
-            "Cp  −2                  +1",
-            egui::FontId::proportional(10.0),
-            MUTED,
+        pressure_legend(
+            &painter,
+            rect.right_top() + Vec2::new(-158.0, 18.0),
+            view.palette,
         );
     }
     if view.streamlines {

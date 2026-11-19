@@ -311,15 +311,73 @@ impl Scene {
     }
 }
 
+// A balanced spatial index over measured wall-face centres. It is built once
+// on the worker when a completed field is opened. Older cases have no samples.
+struct WallPressures(Vec<(DVec3, f64)>);
+impl WallPressures {
+    fn new(samples: &[(DVec3, f64)]) -> Self {
+        fn partition(nodes: &mut [(DVec3, f64)], axis: usize) {
+            if nodes.len() < 2 {
+                return;
+            }
+            let mid = nodes.len() / 2;
+            let (left, _, right) =
+                nodes.select_nth_unstable_by(mid, |a, b| a.0[axis].total_cmp(&b.0[axis]));
+            partition(left, (axis + 1) % 3);
+            partition(right, (axis + 1) % 3);
+        }
+        let mut nodes = samples.to_vec();
+        partition(&mut nodes, 0);
+        Self(nodes)
+    }
+    fn nearest(&self, p: DVec3) -> Option<f64> {
+        fn visit(nodes: &[(DVec3, f64)], axis: usize, p: DVec3, best: &mut (f64, f64)) {
+            if nodes.is_empty() {
+                return;
+            }
+            let (left, rest) = nodes.split_at(nodes.len() / 2);
+            let (node, right) = rest.split_first().unwrap();
+            let distance = p.distance_squared(node.0);
+            if distance < best.0 {
+                *best = (distance, node.1);
+            }
+            let offset = p[axis] - node.0[axis];
+            let (near, far) = if offset < 0.0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let next = (axis + 1) % 3;
+            visit(near, next, p, best);
+            if offset * offset < best.0 {
+                visit(far, next, p, best);
+            }
+        }
+        let mut best = (f64::INFINITY, 0.0);
+        visit(&self.0, 0, p, &mut best);
+        best.0.is_finite().then_some(best.1)
+    }
+}
+
 impl Scene {
-    /// CFD surfaces retain neutral lighting; volume colors/lines are read from
-    /// OpenFOAM. Never paint a panel Cp onto an unrelated imported solid.
     pub fn volume(
         mesh: &glenn_extended::mesh::SolidMesh,
-        paths: &[Vec<DVec3>],
-        field: Option<&glenn_extended::cfd::VolumeField>,
-        speed: f64,
+        solved: Option<(
+            &glenn_extended::cfd::RunResult,
+            &glenn_extended::cfd::Config,
+        )>,
     ) -> Self {
+        let samples = WallPressures::new(solved.map_or(&[], |(r, _)| r.wall_pressure.as_slice()));
+        let q = solved.map_or(1.0, |(_, cfg)| 0.5 * cfg.density * cfg.speed.powi(2));
+        let colors: Vec<_> = mesh
+            .vertices
+            .iter()
+            .map(|&p| {
+                samples.nearest(p).map_or([0.62, 0.75, 0.82, 1.0], |gauge| {
+                    crate::ui::tunnel::color(gauge / q, 0).to_normalized_gamma_f32()
+                })
+            })
+            .collect();
         let mut scene = Self {
             vertices: Vec::new(),
             solid_count: 0,
@@ -328,33 +386,34 @@ impl Scene {
         for t in &mesh.triangles {
             let [a, b, c] = t.map(|i| mesh.vertices[i].as_vec3());
             let n = (b - a).cross(c - a).normalize_or_zero();
-            for p in [a, b, c] {
+            for &id in t {
                 scene.vertices.push(Vertex {
-                    position: p.to_array(),
+                    position: mesh.vertices[id].as_vec3().to_array(),
                     normal: n.to_array(),
-                    color: [0.62, 0.75, 0.82, 1.0],
+                    color: colors[id],
                     data: [0.0; 4],
                 });
             }
         }
         scene.solid_count = scene.vertices.len() as u32;
-        if paths.is_empty() {
+        let Some((result, cfg)) = solved else {
             return scene;
-        }
+        };
         let (lo, hi) = mesh.bounds();
         let radius = ((hi - lo).max_element() * 0.002) as f32;
         let surface = glenn_extended::mesh::SurfaceIndex::new(mesh);
-        for line in paths {
+        for line in &result.streamlines {
             let mut travel = 0.0_f32;
             for pair in line.windows(2) {
                 if surface.crosses(pair[0], pair[1]) {
                     break;
                 }
-                let v = field
-                    .and_then(|f| f.sample_velocity(pair[0]))
+                let v = result
+                    .field
+                    .sample_velocity(pair[0])
                     .map_or(0.0, |v| v.length());
                 let mut rgb =
-                    crate::ui::tunnel::speed_color(v / speed.max(1e-8)).to_normalized_gamma_f32();
+                    crate::ui::tunnel::speed_color(v / cfg.speed).to_normalized_gamma_f32();
                 rgb[3] = 0.75;
                 let next = travel + (pair[0].distance(pair[1]) / v.max(1e-8)) as f32;
                 scene.tube(
@@ -375,6 +434,20 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pressure_color_uses_the_nearest_measured_wall_face() {
+        let samples = [
+            (DVec3::new(1.0, 0.01, 0.0), -2500.0),
+            (DVec3::new(1.0, -0.01, 0.0), 1800.0),
+            (DVec3::ZERO, 500.0),
+        ];
+        let tree = WallPressures::new(&samples);
+        for &(p, pressure) in &samples {
+            assert_eq!(tree.nearest(p + DVec3::X * 0.001), Some(pressure));
+        }
+        assert_eq!(WallPressures::new(&[]).nearest(DVec3::ZERO), None);
+    }
+
     #[test]
     fn line_instances_preserve_physical_endpoints_and_convective_time() {
         let mut scene = Scene {

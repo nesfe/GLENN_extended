@@ -55,8 +55,10 @@ pub struct Volume {
     quantity: usize,
     pub(super) tab: usize,
     slice_map: Option<SliceMap>,
+    close_slice: bool,
     show_lines: bool,
     reference_area: f64,
+    mean_from: f64,
     comparison: super::volume_compare::Comparison,
     animate: bool,
     clock: f64,
@@ -92,12 +94,7 @@ impl Default for Volume {
                 (mesh, config, result)
             };
             token.check()?;
-            let scene = render::Scene::volume(
-                &mesh,
-                &result.streamlines,
-                Some(&result.field),
-                config.speed,
-            );
+            let scene = render::Scene::volume(&mesh, Some((&result, &config)));
             let settings = serde_json::to_string(&config).unwrap() + &request.scale.to_string();
             Ok(Completed {
                 bounds: mesh.bounds(),
@@ -112,7 +109,7 @@ impl Default for Volume {
         Self {
             preview_worker: Worker::new(|mesh: Arc<SolidMesh>, token| {
                 token.check()?;
-                let scene = render::Scene::volume(&mesh, &[], None, 1.0);
+                let scene = render::Scene::volume(&mesh, None);
                 token.check()?;
                 Ok(scene)
             }),
@@ -147,7 +144,9 @@ impl Default for Volume {
             quantity: 0,
             tab: 0,
             slice_map: None,
+            close_slice: true,
             reference_area: 0.0,
+            mean_from: 0.0,
             comparison: Default::default(),
             show_lines: true,
             animate: true,
@@ -228,6 +227,12 @@ impl Volume {
                         as usize;
                     self.slice_map = None;
                     self.comparison.reset();
+                    if let (Some((first, _)), Some((last, _))) = (
+                        result.result.force_history.first(),
+                        result.result.force_history.last(),
+                    ) {
+                        self.mean_from = 0.5 * (first + last);
+                    }
                     self.result = Some(result);
                     self.dirty = true;
                 }
@@ -466,9 +471,7 @@ impl Volume {
                     "Стенка модели · y⁺ мин. {min:.1} · сред. {avg:.1} · макс. {max:.1}"
                 ));
             }
-            if completed.config.model == FlowModel::UnsteadyRans {
-                ui.colored_label(AMBER, "Мгновенное поле URANS. Для средних сил требуется установившаяся статистика во времени.");
-            } else if !r.converged {
+            if completed.config.model != FlowModel::UnsteadyRans && !r.converged {
                 ui.colored_label(AMBER,"Стационарная сходимость не подтверждена. Это не автоматически достоверный инженерный результат.");
             }
             ui.small(format!(
@@ -479,6 +482,21 @@ impl Volume {
         if self.tab == 2
             && let Some(result) = &self.result
         {
+            if result.config.model == FlowModel::UnsteadyRans {
+                let history = &result.result.force_history;
+                if let (Some(&(first, _)), Some(&(last, _))) = (history.first(), history.last())
+                    && last > first
+                {
+                    ui.add(
+                        egui::Slider::new(&mut self.mean_from, first..=last)
+                            .text("Усреднять силы с t, с")
+                            .max_decimals(8),
+                    );
+                    if let Some(mean) = time_mean_force(history, self.mean_from) {
+                        ui.label(format!("Средние силы за {:.6}…{last:.6} с · Fx {:.2} Н · Fy {:.2} Н · Fz {:.2} Н",self.mean_from,mean.x,mean.y,mean.z));
+                    }
+                }
+            }
             charts(ui, result);
             if !result.result.wall_pressure.is_empty() {
                 let f = &result.result.field;
@@ -548,7 +566,8 @@ impl Volume {
         {
             show_slice(
                 ui,
-                &result.result.field,
+                result,
+                &mut self.close_slice,
                 &mut self.slice,
                 &mut self.quantity,
                 &mut self.slice_map,
@@ -645,6 +664,17 @@ impl Volume {
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|r| !r.result.wall_pressure.is_empty())
+        {
+            super::tunnel::pressure_legend(
+                &ui.painter_at(rect),
+                rect.right_top() + Vec2::new(-158.0, 18.0),
+                0,
+            );
+        }
     }
 }
 struct SliceMap {
@@ -652,7 +682,30 @@ struct SliceMap {
     quantity: usize,
     texture: egui::TextureHandle,
     range: (f64, f64),
+    outline: Vec<[glam::DVec2; 2]>,
+    section_bounds: Option<(glam::DVec2, glam::DVec2)>,
 }
+fn time_mean_force(samples: &[(f64, glam::DVec3)], start: f64) -> Option<glam::DVec3> {
+    let end = samples.last()?.0;
+    let start = start.max(samples.first()?.0);
+    if start >= end {
+        return None;
+    }
+    let mut integral = glam::DVec3::ZERO;
+    let index = samples
+        .partition_point(|(t, _)| *t <= start)
+        .saturating_sub(1);
+    for pair in samples[index..].windows(2) {
+        let [(t0, f0), (t1, f1)] = [pair[0], pair[1]];
+        let a = t0.max(start);
+        if t1 > a {
+            let fa = f0.lerp(f1, (a - t0) / (t1 - t0));
+            integral += 0.5 * (t1 - a) * (fa + f1);
+        }
+    }
+    Some(integral / (end - start))
+}
+
 fn charts(ui: &mut egui::Ui, completed: &Completed) {
     use super::plots::plot;
     use glenn_extended::model::Point;
@@ -720,11 +773,13 @@ fn slice_color(t: f64) -> Color32 {
 }
 fn show_slice(
     ui: &mut egui::Ui,
-    field: &cfd::VolumeField,
+    completed: &Completed,
+    close: &mut bool,
     slice: &mut usize,
     quantity: &mut usize,
     cache: &mut Option<SliceMap>,
 ) {
+    let field = &completed.result.field;
     ui.horizontal_wrapped(|ui| {
         ui.add(egui::Slider::new(slice, 0..=field.dims[2] - 1).text("Сечение Z"));
         for (i, label) in ["Скорость X, м/с", "Давление, Па", "|ω|, 1/с"]
@@ -766,7 +821,32 @@ fn show_slice(
             egui::ColorImage::new([nx, ny], pixels),
             egui::TextureOptions::NEAREST,
         );
+        let z = field.position(offset).z;
+        let mut outline = Vec::new();
+        for tri in &completed.mesh.triangles {
+            let vertices = tri.map(|i| completed.mesh.vertices[i]);
+            let mut points = vertices
+                .iter()
+                .zip(vertices.iter().cycle().skip(1))
+                .filter_map(|(&a, &b)| {
+                    if (a.z > z) == (b.z > z) {
+                        return None;
+                    }
+                    Some(a.lerp(b, (z - a.z) / (b.z - a.z)).truncate())
+                });
+            if let (Some(a), Some(b)) = (points.next(), points.next())
+                && a.distance_squared(b) > 1e-24
+            {
+                outline.push([a, b]);
+            }
+        }
+        let section_bounds = outline.iter().flatten().copied().fold(None, |bounds, p| {
+            let (lo, hi): (glam::DVec2, glam::DVec2) = bounds.unwrap_or((p, p));
+            Some((lo.min(p), hi.max(p)))
+        });
         *cache = Some(SliceMap {
+            outline,
+            section_bounds,
             slice: *slice,
             quantity: *quantity,
             texture,
@@ -784,26 +864,11 @@ fn show_slice(
         "Z = {:.3} м · тёмные ячейки вне поля данных",
         field.position(offset).z
     ));
-    let w = ui.available_width();
-    let ratio = ((field.max.x - field.min.x) / (field.max.y - field.min.y)) as f32;
-    let h = (w / ratio).min(ui.ctx().content_rect().height() * 0.60);
-    let response = ui.add(
-        egui::Image::new((c.texture.id(), Vec2::new(h * ratio, h))).sense(egui::Sense::hover()),
-    );
-    if let Some(p) = response.hover_pos() {
-        let rect = response.rect;
-        let x = (((p.x - rect.left()) / rect.width() * nx as f32) as usize).min(nx - 1);
-        let y = (((rect.bottom() - p.y) / rect.height() * ny as f32) as usize).min(ny - 1);
-        let i = offset + y * nx + x;
-        let pos = field.position(i);
-        response.on_hover_text(format!(
-            "X {:.3} м · Y {:.3} м · {}",
-            pos.x,
-            pos.y,
-            val(i).map_or_else(|| "нет данных".to_string(), |v| format!("{v:.4} {unit}"))
-        ));
-    }
     ui.horizontal(|ui| {
+        if c.section_bounds.is_some() {
+            ui.selectable_value(close, true, "У модели");
+            ui.selectable_value(close, false, "Всё поле");
+        }
         ui.label(format!("{lo:.3}"));
         let (rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width().min(180.0), 12.0),
@@ -822,4 +887,71 @@ fn show_slice(
         }
         ui.label(format!("{hi:.3} {unit}"));
     });
+    let mut low = field.min.truncate();
+    let mut high = field.max.truncate();
+    if *close && let Some((a, b)) = c.section_bounds {
+        let chord = (b - a).max_element();
+        low = low.max(a - glam::DVec2::new(0.38, 0.43) * chord);
+        high = high.min(b + glam::DVec2::new(0.85, 0.43) * chord);
+    }
+    let span = (high - low).as_vec2();
+    let ratio = span.x / span.y;
+    let h = (ui.available_width() / ratio)
+        .min((ui.clip_rect().bottom() - ui.cursor().top() - 12.0).clamp(180.0, 1200.0));
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(h * ratio, h), egui::Sense::hover());
+    let dims = glam::DVec2::new(nx as f64, ny as f64);
+    let grid = |xy: glam::DVec2| {
+        (xy - field.min.truncate()) / (field.max - field.min).truncate() * (dims - glam::DVec2::ONE)
+    };
+    let uv = |xy: glam::DVec2| {
+        let pos = (grid(xy) + glam::DVec2::splat(0.5)) / dims;
+        egui::pos2(pos.x as f32, 1.0 - pos.y as f32)
+    };
+    let uv_rect = egui::Rect::from_two_pos(uv(low), uv(high));
+    let painter = ui.painter_at(rect);
+    painter.image(c.texture.id(), rect, uv_rect, Color32::WHITE);
+    let screen = |xy: glam::DVec2| {
+        let f = (xy - low) / (high - low);
+        egui::pos2(
+            rect.left() + rect.width() * f.x as f32,
+            rect.bottom() - rect.height() * f.y as f32,
+        )
+    };
+    for &[a, b] in &c.outline {
+        painter.line_segment(
+            [screen(a), screen(b)],
+            egui::Stroke::new(1.4, Color32::WHITE),
+        );
+    }
+    if let Some(p) = response.hover_pos() {
+        let fraction = glam::DVec2::new(
+            ((p.x - rect.left()) / rect.width()) as f64,
+            ((rect.bottom() - p.y) / rect.height()) as f64,
+        );
+        let at = grid(low + fraction * (high - low)).round().as_uvec2();
+        let i = offset + (at.y as usize).min(ny - 1) * nx + (at.x as usize).min(nx - 1);
+        let pos = field.position(i);
+        response.on_hover_text(format!(
+            "X {:.3} м · Y {:.3} м · {}",
+            pos.x,
+            pos.y,
+            val(i).map_or_else(|| "нет данных".into(), |v| format!("{v:.4} {unit}"))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod force_statistics {
+    use super::time_mean_force;
+    use glam::DVec3;
+    #[test]
+    fn partial_window_uses_physical_time_on_nonuniform_steps() {
+        let s = [
+            (0.0, DVec3::ZERO),
+            (1.0, DVec3::X * 2.0),
+            (4.0, DVec3::X * 8.0),
+        ];
+        assert_eq!(time_mean_force(&s, 0.5), Some(DVec3::X * 4.5));
+        assert_eq!(time_mean_force(&s, 4.0), None);
+    }
 }
