@@ -1,4 +1,4 @@
-use crate::{Config, FlowModel, VolumeField, read_field, write_case};
+use crate::{Config, FlowModel, VolumeField, read_field};
 use glam::DVec3;
 use glenn_core::mesh::SolidMesh;
 use glenn_engine::Cancellation;
@@ -181,15 +181,16 @@ fn stage(
                 break;
             }
             let log = decode_log(&fs::read(&log_path).unwrap_or_default());
-            let tail = log
-                .lines()
-                .rev()
-                .take(18)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
+            let failure = log
+                .rfind("--> FOAM FATAL")
+                .map_or(log.as_str(), |start| &log[start..]);
+            let lines: Vec<_> = failure.lines().collect();
+            let excerpt = if failure.len() == log.len() {
+                &lines[lines.len().saturating_sub(18)..]
+            } else {
+                &lines[..lines.len().min(32)]
+            };
+            let tail = excerpt.join("\n");
             return Err(format!(
                 "{tool} завершился с ошибкой. Журнал: {}\n{tail}",
                 log_path.display()
@@ -252,7 +253,7 @@ pub fn run(
     if backend.bashrc.is_empty() && !backend.wsl {
         crate::runtime::Runtime::discover()?;
     }
-    write_case(case, mesh, cfg)?;
+    crate::case::write_case_for_platform(case, mesh, cfg, cfg!(windows) && !backend.wsl)?;
     let original_case = case.canonicalize().map_err(|e| e.to_string())?;
     let alias = if !backend.wsl {
         Some(crate::paths::SolverPath::new(&original_case)?)

@@ -125,6 +125,15 @@ fn vec(v: DVec3) -> String {
 }
 /// Fresh case only. Units are metres, seconds, kg. User files are never overwritten.
 pub fn write_case(dir: &Path, mesh: &SolidMesh, cfg: &Config) -> Result<(), String> {
+    write_case_for_platform(dir, mesh, cfg, cfg!(windows))
+}
+
+pub(crate) fn write_case_for_platform(
+    dir: &Path,
+    mesh: &SolidMesh,
+    cfg: &Config,
+    native_windows: bool,
+) -> Result<(), String> {
     cfg.validate()?;
     let mut checked = mesh.clone();
     let report = checked.validate_and_orient()?;
@@ -306,8 +315,15 @@ mergeTolerance 1e-6;
     let far_pressure =
         format!("type freestreamPressure; freestreamValue uniform {reference_pressure};");
     let out_pressure = if transient_gas {
+        // The MinGW object registry sanitizes scoped field names for Windows.
+        // WSL runs the Linux binary even when GLENN itself runs on Windows.
+        let psi = if native_windows {
+            "thermo_psi"
+        } else {
+            "thermo:psi"
+        };
         format!(
-            "type waveTransmissive; field p; psi thermo:psi; gamma 1.4; fieldInf {reference_pressure}; lInf {l}; value uniform {reference_pressure};"
+            "type waveTransmissive; field p; psi {psi}; gamma 1.4; fieldInf {reference_pressure}; lInf {l}; value uniform {reference_pressure};"
         )
     } else {
         far_pressure.clone()
