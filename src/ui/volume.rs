@@ -389,7 +389,7 @@ impl Volume {
                 }
             });
             if self.cfg.resolution == Resolution::Preview {
-                ui.colored_label(AMBER,"Грубая сетка без призматических слоёв: только предварительное исследование потока, не проверенная точность сил/отрыва.");
+                ui.small("Быстрый просмотр строит объёмную сетку без пристеночных слоёв. На средней и подробной сетках добавляются призмы вдоль поверхности.");
             }
             ui.horizontal_wrapped(|ui| {
                 ui.add(
@@ -462,17 +462,24 @@ impl Volume {
                 );
             }
             let r = &completed.result;
+            let step = if completed.config.model == FlowModel::UnsteadyRans {
+                format!("Время {:.6} с", r.field.time)
+            } else {
+                let status = if r.converged {
+                    "критерий невязок достигнут"
+                } else {
+                    "критерий невязок ещё не достигнут"
+                };
+                format!("Итерация {:.0} · {status}", r.field.time)
+            };
             ui.label(format!(
-                "t = {:.6} · Fx {:.4} Н · Fy {:.4} Н · Fz {:.4} Н",
-                r.field.time, r.force.x, r.force.y, r.force.z
+                "{step} · Fx {:.4} Н · Fy {:.4} Н · Fz {:.4} Н",
+                r.force.x, r.force.y, r.force.z
             ));
             if let Some([min, max, avg]) = r.wall_y_plus {
                 ui.label(format!(
                     "Стенка модели · y⁺ мин. {min:.1} · сред. {avg:.1} · макс. {max:.1}"
                 ));
-            }
-            if completed.config.model != FlowModel::UnsteadyRans && !r.converged {
-                ui.colored_label(AMBER,"Стационарная сходимость не подтверждена. Это не автоматически достоверный инженерный результат.");
             }
             ui.small(format!(
                 "Журналы, поля и result.foam для ParaView: {}",
@@ -573,7 +580,6 @@ impl Volume {
                 &mut self.slice_map,
             );
         }
-        ui.small("Отрыв исследуйте по обратной скорости в следе и завихренности; для выводов нужны сходимость, независимость от сетки, y+ и сравнение с экспериментом. URANS не разрешает все турбулентные вихри.");
     }
     fn viewport(&mut self, ui: &mut egui::Ui) {
         if self.result.is_none() && self.preview.is_none() {
@@ -706,6 +712,21 @@ fn time_mean_force(samples: &[(f64, glam::DVec3)], start: f64) -> Option<glam::D
     Some(integral / (end - start))
 }
 
+fn force_mean_change(samples: &[(f64, glam::DVec3)]) -> Option<(usize, glam::DVec3)> {
+    let window = (samples.len() / 2).min(100);
+    if window < 2 {
+        return None;
+    }
+    let (previous, latest) = samples[samples.len() - 2 * window..].split_at(window);
+    let change = latest
+        .iter()
+        .zip(previous)
+        .map(|((_, new), (_, old))| *new - *old)
+        .sum::<glam::DVec3>()
+        / window as f64;
+    Some((window, change))
+}
+
 fn charts(ui: &mut egui::Ui, completed: &Completed) {
     use super::plots::plot;
     use glenn_extended::model::Point;
@@ -734,6 +755,14 @@ fn charts(ui: &mut egui::Ui, completed: &Completed) {
         ],
         false,
     );
+    if completed.config.model != FlowModel::UnsteadyRans
+        && let Some((window, change)) = force_mean_change(&r.force_history)
+    {
+        ui.small(format!(
+            "Изменение средней силы за два последних окна по {window} отсчётов · ΔFx {:+.3} Н · ΔFy {:+.3} Н · ΔFz {:+.3} Н",
+            change.x, change.y, change.z
+        ));
+    }
     let residuals: [Vec<Point>; 4] = std::array::from_fn(|i| {
         r.residuals[i]
             .iter()
@@ -942,7 +971,7 @@ fn show_slice(
 
 #[cfg(test)]
 mod force_statistics {
-    use super::time_mean_force;
+    use super::{force_mean_change, time_mean_force};
     use glam::DVec3;
     #[test]
     fn partial_window_uses_physical_time_on_nonuniform_steps() {
@@ -953,5 +982,12 @@ mod force_statistics {
         ];
         assert_eq!(time_mean_force(&s, 0.5), Some(DVec3::X * 4.5));
         assert_eq!(time_mean_force(&s, 4.0), None);
+    }
+    #[test]
+    fn steady_force_change_uses_two_adjacent_complete_windows() {
+        let s: Vec<_> = (0..205).map(|i| (i as f64, DVec3::Y * i as f64)).collect();
+        assert_eq!(force_mean_change(&s[..3]), None);
+        assert_eq!(force_mean_change(&s[..7]), Some((3, DVec3::Y * 3.0)));
+        assert_eq!(force_mean_change(&s), Some((100, DVec3::Y * 100.0)));
     }
 }

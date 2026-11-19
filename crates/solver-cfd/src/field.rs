@@ -151,15 +151,22 @@ impl VolumeField {
         lines
     }
 }
-fn latest(dir: &Path) -> Result<(f64, PathBuf), String> {
-    fs::read_dir(dir)
+fn time_directories(dir: &Path) -> Result<Vec<(f64, PathBuf)>, String> {
+    let mut times: Vec<_> = fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(Result::ok)
         .filter_map(|e| {
             let t = e.file_name().to_str()?.parse::<f64>().ok()?;
             (t.is_finite() && e.path().is_dir()).then_some((t, e.path()))
         })
-        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .collect();
+    times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(times)
+}
+
+fn latest(dir: &Path) -> Result<(f64, PathBuf), String> {
+    time_directories(dir)?
+        .pop()
         .ok_or("Нет результатов выборки поля OpenFOAM".into())
 }
 pub fn read_field(case: &Path, density: f64) -> Result<VolumeField, String> {
@@ -303,7 +310,21 @@ pub(crate) fn wall_y_plus(case: &Path, time: f64) -> Option<[f64; 3]> {
 }
 
 pub(crate) fn loads(case: &Path) -> Result<Vec<(f64, DVec3)>, String> {
-    let (_, dir) = latest(&case.join("postProcessing/loads"))?;
+    let mut history = Vec::new();
+    for (restart, dir) in time_directories(&case.join("postProcessing/loads"))? {
+        let records = load_segment(&dir)?;
+        // The state at restart is shared; later iterations from the old run
+        // were superseded even if the new run ended sooner.
+        history.truncate(history.partition_point(|&(t, _)| t <= restart && t < records[0].0));
+        history.extend(records);
+    }
+    if history.is_empty() {
+        return Err("Нет конечных сил из расчёта OpenFOAM".into());
+    }
+    Ok(history)
+}
+
+fn load_segment(dir: &Path) -> Result<Vec<(f64, DVec3)>, String> {
     let modern = dir.join("force.dat");
     let is_modern = modern.exists();
     let path = if is_modern {
@@ -332,6 +353,9 @@ pub(crate) fn loads(case: &Path) -> Result<Vec<(f64, DVec3)>, String> {
         } else {
             DVec3::new(v[1] + v[4] + v[7], v[2] + v[5] + v[8], v[3] + v[6] + v[9])
         };
+        if history.last().is_some_and(|&(time, _)| v[0] <= time) {
+            return Err("Нарушен порядок отсчётов сил OpenFOAM".into());
+        }
         history.push((v[0], force));
     }
     if history.is_empty() {
@@ -374,6 +398,29 @@ mod tests {
 #[cfg(test)]
 mod load_tests {
     use super::*;
+    #[test]
+    fn resumed_loads_keep_the_prefix_and_replace_abandoned_iterations() {
+        let root = tempfile::tempdir().unwrap();
+        for (start, rows) in [
+            ("0", vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]),
+            ("2", vec![(3, 31), (4, 41)]),
+            ("3", vec![(3, 32), (4, 42)]),
+        ] {
+            let dir = root.path().join("postProcessing/loads").join(start);
+            fs::create_dir_all(&dir).unwrap();
+            let contents: String = rows
+                .into_iter()
+                .map(|(t, f)| format!("{t} {f} 0 0 0 0 0 0 0 0\n"))
+                .collect();
+            fs::write(dir.join("force.dat"), contents).unwrap();
+        }
+        let forces: Vec<_> = loads(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|(t, f)| (t, f.x))
+            .collect();
+        assert_eq!(forces, [(1., 10.), (2., 20.), (3., 32.), (4., 42.)]);
+    }
     #[test]
     fn modern_total_force_is_not_added_to_its_components_again() {
         let root = std::env::temp_dir().join(format!(
