@@ -13,7 +13,7 @@ import time
 
 URL = 'https://dl.openfoam.com/source/v2412/OpenFOAM-v2412-windows-mingw.exe'
 SHA256 = '7c31c0526786307465cd34b4ac820530fbd52c31225d9b03713903a8f84a7028'
-TOOLS = ('blockMesh', 'snappyHexMesh', 'checkMesh', 'simpleFoam', 'pimpleFoam', 'rhoSimpleFoam', 'rhoPimpleFoam', 'postProcess')
+TOOLS = ('blockMesh', 'snappyHexMesh', 'checkMesh', 'simpleFoam', 'pimpleFoam', 'rhoSimpleFoam', 'rhoCentralFoam', 'postProcess')
 
 
 def bundle(destination):
@@ -50,7 +50,7 @@ def bundle(destination):
     for tool in TOOLS:
         if not (binary / f'{tool}.exe').is_file():
             raise RuntimeError(f'Upstream package is missing {tool}')
-    # Keep all loadable libraries, but only the six commands used by GLENN.
+    # Keep all loadable libraries, but only the commands used by GLENN.
     # Tutorials and unrelated solvers are not needed at runtime.
     shutil.rmtree(destination / 'tutorials', ignore_errors=True)
     for executable in binary.glob('*.exe'):

@@ -110,6 +110,25 @@ fn imported_pressure_has_physical_units_and_fields_cannot_mix_times() {
     assert_eq!(result.field.pressure[0], Some(6.0));
     assert_eq!(result.force.x, 3.0);
     assert!(result.converged);
+    let gas = Config {
+        air_temperature: Some(288.15),
+        density: 2.0,
+        ..Config::default()
+    };
+    std::fs::write(
+        root.join("glenn-case.json"),
+        serde_json::to_string(&gas).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join("log.rhoSimpleFoam"), "Time = 10\n").unwrap();
+    let absolute = gas.reference_pressure().unwrap() + 3.0;
+    std::fs::write(
+        &field,
+        cloud.replace(" 3 1 0 0 0 0 0\n", &format!(" {absolute} 1 0 0 0 0 0\n")),
+    )
+    .unwrap();
+    let result = glenn_solver_cfd::load_result(&root).unwrap();
+    assert!((result.field.pressure[0].unwrap() - 3.0).abs() < 1e-8);
     std::fs::write(&field, cloud.replacen("3 1", "broken 1", 1)).unwrap();
     assert!(glenn_solver_cfd::load_result(&root).is_err());
     std::fs::remove_dir_all(root).unwrap();
@@ -151,4 +170,34 @@ fn a_previously_saved_empty_tunnel_is_rejected() {
         let error = glenn_solver_cfd::load_result(root.path()).err().unwrap();
         assert!(error.contains("body: 0 граней"), "{error}");
     }
+}
+
+#[test]
+fn surface_layers_get_thinner_as_friction_speed_increases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut thicknesses = Vec::new();
+    for speed in [20.0, 170.0] {
+        let cfg = Config {
+            air_temperature: Some(288.15),
+            resolution: glenn_solver_cfd::Resolution::Standard,
+            speed,
+            ..Config::default()
+        };
+        let dir = tmp.path().join(speed.to_string());
+        write_case(&dir, &cube(), &cfg).unwrap();
+        let mesh = std::fs::read_to_string(dir.join("system/snappyHexMeshDict")).unwrap();
+        assert!(mesh.contains("relativeSizes false"));
+        assert!(mesh.contains("addLayers true"));
+        thicknesses.push(
+            mesh.split_once("firstLayerThickness ")
+                .unwrap()
+                .1
+                .split(';')
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+        );
+    }
+    assert!(thicknesses[1] > 0.0 && thicknesses[1] < thicknesses[0]);
 }

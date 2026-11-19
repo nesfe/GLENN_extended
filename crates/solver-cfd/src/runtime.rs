@@ -16,7 +16,7 @@ pub const TOOLS: [&str; 8] = [
     "pimpleFoam",
     "postProcess",
     "rhoSimpleFoam",
-    "rhoPimpleFoam",
+    "rhoCentralFoam",
 ];
 #[derive(Deserialize)]
 struct Manifest {

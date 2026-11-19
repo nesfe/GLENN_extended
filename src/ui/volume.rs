@@ -53,7 +53,7 @@ pub struct Volume {
     zoom: f32,
     slice: usize,
     quantity: usize,
-    tab: usize,
+    pub(super) tab: usize,
     slice_map: Option<SliceMap>,
     show_lines: bool,
     reference_area: f64,
@@ -121,7 +121,11 @@ impl Default for Volume {
             bounds: (glam::DVec3::ZERO, glam::DVec3::ONE),
             mesh: None,
             name: String::new(),
-            cfg: Config::default(),
+            cfg: Config {
+                resolution: Resolution::Standard,
+                iterations: 3000,
+                ..Config::default()
+            },
             backend: Backend::default(),
             scale: 1.0,
             folder: std::env::current_dir()

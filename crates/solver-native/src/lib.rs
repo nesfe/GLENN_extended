@@ -2,6 +2,7 @@
 //! local Smagorinsky stress and stationary halfway bounce-back walls.
 //! No prescribed separation point, circulation, wake, or lift curve.
 mod compressible;
+mod cut_cells;
 pub mod worker;
 
 use glenn_core::{geometry::Airfoil, model::Point};
@@ -54,6 +55,20 @@ pub fn resolved_reynolds(chord_cells: usize) -> f64 {
 }
 
 impl Config {
+    fn validate_grid(&self) -> Result<(), String> {
+        if !(24..=96).contains(&self.chord_cells)
+            || !self.reynolds.is_finite()
+            || self.reynolds <= 0.0
+            || !self.alpha.is_finite()
+            || self
+                .contour
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite())
+        {
+            return Err("Недопустимые параметры встроенного решателя".into());
+        }
+        Ok(())
+    }
     pub fn gas_section(
         foil: &Airfoil,
         alpha: f64,
@@ -192,13 +207,16 @@ impl Solver {
         {
             return Err("Недопустимые параметры газа".into());
         }
-        let lattice = Lattice::new(config)?;
-        if lattice.config.mach > 0.3 {
+        if config.mach > 0.3 {
+            config.validate_grid()?;
+            let n = config.chord_cells;
             Ok(Self::Compressible(compressible::Compressible::new(
-                lattice,
+                &config,
+                7 * n,
+                4 * n,
             )?))
         } else {
-            Ok(Self::Lattice(lattice))
+            Ok(Self::Lattice(Lattice::new(config)?))
         }
     }
     pub fn advance(&mut self, count: usize) -> Result<(), String> {
@@ -255,17 +273,7 @@ fn inside(p: [f64; 2], contour: &[[f64; 2]]) -> bool {
 }
 impl Lattice {
     pub fn new(config: Config) -> Result<Self, String> {
-        if !(24..=96).contains(&config.chord_cells)
-            || !config.reynolds.is_finite()
-            || config.reynolds <= 0.0
-            || !config.alpha.is_finite()
-            || config
-                .contour
-                .iter()
-                .any(|p| !p.x.is_finite() || !p.y.is_finite())
-        {
-            return Err("Недопустимые параметры встроенного решателя".into());
-        }
+        config.validate_grid()?;
         let n = config.chord_cells;
         let (width, height) = (7 * n, 4 * n);
         let (s, c) = (-config.alpha.to_radians()).sin_cos();

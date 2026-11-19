@@ -1,8 +1,8 @@
 //! Conservative 2D compressible Navier–Stokes, ideal calorically perfect gas.
-//! MUSCL/MC reconstruction, HLLE flux, SSP-RK2; Newtonian stress and Fourier heat
+//! MUSCL/MC reconstruction, HLLC flux, SSP-RK2; Newtonian stress and Fourier heat
 //! conduction. Units: chord=U_inf=rho_inf=1. This is a coarse section calculation,
 //! not a replacement for a grid-converged three-dimensional flight calculation.
-use crate::{Lattice, Snapshot};
+use crate::{Config, Snapshot};
 
 type State = [f64; 4]; // conserved: rho, rho*u, rho*v, total energy
 // Primitive: rho, u, v, p. Temperature below means R*T in velocity-squared units.
@@ -36,7 +36,7 @@ fn euler_flux(w: State, axis: usize, gamma: f64) -> State {
     f
 }
 /// Einfeldt wave-speed bounds include the Roe-averaged acoustic waves.
-fn hlle(l: State, r: State, axis: usize, gamma: f64) -> State {
+fn riemann(l: State, r: State, axis: usize, gamma: f64) -> State {
     let (ul, ur) = (l[axis + 1], r[axis + 1]);
     let (al, ar) = ((gamma * l[3] / l[0]).sqrt(), (gamma * r[3] / r[0]).sqrt());
     let (ql, qr) = (conserved(l, gamma), conserved(r, gamma));
@@ -57,6 +57,29 @@ fn hlle(l: State, r: State, axis: usize, gamma: f64) -> State {
     if sr <= 0.0 {
         return fr;
     }
+    // Resolve the contact and shear waves. HLLE alone transports transverse
+    // momentum across even a stationary slip line at the acoustic wave speed.
+    let ml = l[0] * (sl - ul);
+    let mr = r[0] * (sr - ur);
+    let contact = (r[3] - l[3] + ml * ul - mr * ur) / (ml - mr);
+    let (w, q, raw, speed, un, mass) = if contact >= 0.0 {
+        (l, ql, fl, sl, ul, ml)
+    } else {
+        (r, qr, fr, sr, ur, mr)
+    };
+    let density = mass / (speed - contact);
+    let pstar = w[3] + mass * (contact - un);
+    let mut star = [
+        density,
+        density * w[1],
+        density * w[2],
+        ((speed - un) * q[3] - w[3] * un + pstar * contact) / (speed - contact),
+    ];
+    star[axis + 1] = density * contact;
+    if sl < contact && contact < sr && pstar > 0.0 && valid(primitive(star, gamma)) {
+        return std::array::from_fn(|k| raw[k] + speed * (star[k] - q[k]));
+    }
+    // Positive two-wave fallback for a degenerate or inadmissible star state.
     std::array::from_fn(|k| (sr * fl[k] - sl * fr[k] + sl * sr * (qr[k] - ql[k])) / (sr - sl))
 }
 fn mc(a: f64, b: f64) -> f64 {
@@ -72,6 +95,7 @@ pub struct Compressible {
     height: usize,
     cells: usize,
     solid: Vec<bool>,
+    geometry: crate::cut_cells::CutCells,
     q: Vec<State>,
     stage: Vec<State>,
     rhs: Vec<State>,
@@ -88,18 +112,19 @@ pub struct Compressible {
     periodic: bool,
 }
 impl Compressible {
-    pub(crate) fn new(lattice: Lattice) -> Result<Self, String> {
-        let c = &lattice.config;
+    pub(crate) fn new(c: &Config, width: usize, height: usize) -> Result<Self, String> {
         let far = [1.0, 1.0, 0.0, 1.0 / (c.gamma * c.mach * c.mach)];
         if !valid(far) {
             return Err("Недопустимое состояние сжимаемого газа".into());
         }
-        let size = lattice.width * lattice.height;
+        let size = width * height;
+        let geometry = crate::cut_cells::CutCells::new(c, width, height)?;
         Ok(Self {
-            width: lattice.width,
-            height: lattice.height,
+            width,
+            height,
             cells: c.chord_cells,
-            solid: lattice.solid,
+            solid: geometry.volume.iter().map(|&v| v == 0.0).collect(),
+            geometry,
             q: vec![conserved(far, c.gamma); size],
             stage: vec![[0.0; 4]; size],
             first_rhs: vec![[0.0; 4]; size],
@@ -193,34 +218,14 @@ impl Compressible {
         Ok(0.4 / rate)
     }
     fn face_flux(&self, left: Option<usize>, right: Option<usize>, axis: usize) -> State {
-        let wall_l = left.is_some_and(|i| self.solid[i]);
-        let wall_r = right.is_some_and(|i| self.solid[i]);
-        if wall_l && wall_r {
-            return [0.0; 4];
-        }
-        let mut l = left.map_or(self.far, |i| self.w[i]);
-        let mut r = right.map_or(self.far, |i| self.w[i]);
-        let wall = wall_l || wall_r;
-        if wall_l {
-            l = r;
-            l[axis + 1] = -r[axis + 1];
-        }
-        if wall_r {
-            r = l;
-            r[axis + 1] = -l[axis + 1];
-        }
-        // Reflect only normal velocity for the inviscid flux. Tangential
-        // no-slip is imposed by the viscous gradient below.
-        let mut lf = l;
-        let mut rf = r;
-        if !wall {
-            if let Some(i) = left {
-                lf = std::array::from_fn(|k| l[k] + 0.5 * self.slopes[i][axis][k]);
-            }
-            if let Some(i) = right {
-                rf = std::array::from_fn(|k| r[k] - 0.5 * self.slopes[i][axis][k]);
-            }
-        }
+        let l = left.map_or(self.far, |i| self.w[i]);
+        let r = right.map_or(self.far, |i| self.w[i]);
+        let mut lf = left.map_or(l, |i| {
+            std::array::from_fn(|k| l[k] + 0.5 * self.slopes[i][axis][k])
+        });
+        let mut rf = right.map_or(r, |i| {
+            std::array::from_fn(|k| r[k] - 0.5 * self.slopes[i][axis][k])
+        });
         // Limiting density and pressure componentwise preserves positivity of
         // reconstructed states; retain a defensive first-order face fallback.
         if !valid(lf) {
@@ -229,39 +234,22 @@ impl Compressible {
         if !valid(rf) {
             rf = r;
         }
-        let mut flux = hlle(lf, rf, axis, self.gamma);
+        let mut flux = riemann(lf, rf, axis, self.gamma);
         let n = self.cells as f64;
         let mut grad = [[0.0; 3]; 2];
-        let velocity;
-        if wall {
-            let i = if wall_l {
-                right.unwrap()
-            } else {
-                left.unwrap()
-            };
-            let sign = if wall_l { 1.0 } else { -1.0 };
-            // Wall lies halfway to the solid-cell center. Stationary,
-            // impermeable, no slip and adiabatic: no wall energy flux.
-            grad[axis][0] = sign * 2.0 * n * self.w[i][1];
-            grad[axis][1] = sign * 2.0 * n * self.w[i][2];
-            velocity = [0.0, 0.0];
-            flux[0] = 0.0;
-            flux[3] = 0.0;
-        } else {
-            for (d, gradient) in grad.iter_mut().enumerate() {
-                for (k, value) in gradient.iter_mut().enumerate() {
-                    *value = 0.5
-                        * (left.map_or(0.0, |i| self.gradients[i][d][k])
-                            + right.map_or(0.0, |i| self.gradients[i][d][k]));
-                }
+        for (d, gradient) in grad.iter_mut().enumerate() {
+            for (k, value) in gradient.iter_mut().enumerate() {
+                *value = 0.5
+                    * (left.map_or(0.0, |i| self.gradients[i][d][k])
+                        + right.map_or(0.0, |i| self.gradients[i][d][k]));
             }
-            grad[axis] = [
-                n * (r[1] - l[1]),
-                n * (r[2] - l[2]),
-                n * (r[3] / r[0] - l[3] / l[0]),
-            ];
-            velocity = [0.5 * (l[1] + r[1]), 0.5 * (l[2] + r[2])];
         }
+        grad[axis] = [
+            n * (r[1] - l[1]),
+            n * (r[2] - l[2]),
+            n * (r[3] / r[0] - l[3] / l[0]),
+        ];
+        let velocity = [0.5 * (l[1] + r[1]), 0.5 * (l[2] + r[2])];
         let div = grad[0][0] + grad[1][1];
         let shear = self.mu * (grad[0][1] + grad[1][0]);
         let stress = if axis == 0 {
@@ -276,24 +264,19 @@ impl Compressible {
             + self.mu * self.gamma / ((self.gamma - 1.0) * PR) * grad[axis][2];
         flux
     }
-    fn accumulate(
-        &mut self,
-        left: Option<usize>,
-        right: Option<usize>,
-        axis: usize,
-        force: &mut [f64; 2],
-    ) {
+    fn accumulate(&mut self, left: Option<usize>, right: Option<usize>, axis: usize) {
+        let aperture = left.map_or(1.0, |i| self.geometry.open[i][axis]);
+        if aperture < 1e-12
+            || left.is_some_and(|i| self.solid[i])
+            || right.is_some_and(|i| self.solid[i])
+        {
+            return;
+        }
         let flux = self.face_flux(left, right, axis);
-        let n = self.cells as f64;
         for (index, sign) in [(left, -1.0), (right, 1.0)] {
             if let Some(i) = index {
-                if self.solid[i] {
-                    force[0] += sign * flux[1] / n;
-                    force[1] += sign * flux[2] / n;
-                } else {
-                    for (k, f) in flux.iter().enumerate() {
-                        self.rhs[i][k] += sign * n * f;
-                    }
+                for (k, f) in flux.iter().enumerate() {
+                    self.rhs[i][k] += sign * self.cells as f64 * aperture * f;
                 }
             }
         }
@@ -314,7 +297,7 @@ impl Compressible {
                     None
                 };
                 let r = (x < self.width).then_some(y * self.width + x);
-                self.accumulate(l, r, 0, &mut force);
+                self.accumulate(l, r, 0);
             }
         }
         for y in 0..=self.height {
@@ -330,9 +313,29 @@ impl Compressible {
                     None
                 };
                 let r = (y < self.height).then_some(y * self.width + x);
-                self.accumulate(l, r, 1, &mut force);
+                self.accumulate(l, r, 1);
             }
         }
+        let n = self.cells as f64;
+        for wall in &self.geometry.walls {
+            let [nx, ny] = wall.normal;
+            let [rho, u, v, p] = self.w[wall.cell];
+            let un = u * nx + v * ny;
+            // Riemann problem in the local normal direction at an impermeable
+            // wall. Viscous no-slip traction uses the fluid centroid distance.
+            let pressure = riemann([rho, un, 0.0, p], [rho, -un, 0.0, p], 0, self.gamma)[1];
+            let viscous = self.mu * n / wall.distance.max(1e-8);
+            let traction = [
+                pressure * nx + viscous * (u + un * nx / 3.0),
+                pressure * ny + viscous * (v + un * ny / 3.0),
+            ];
+            for k in 0..2 {
+                let load = wall.length * traction[k];
+                self.rhs[wall.cell][k + 1] -= n * load;
+                force[k] += load / n;
+            }
+        }
+        self.geometry.distribute(&mut self.rhs);
         force
     }
     pub fn advance(&mut self, count: usize) -> Result<(), String> {
@@ -384,7 +387,7 @@ impl Compressible {
         let mut pressure = vec![0.0; self.q.len()];
         let (mut density, mut count, mut min_ux) = (0.0, 0, 1.0_f32);
         for i in 0..self.q.len() {
-            if self.solid[i] {
+            if self.geometry.sample_solid[i] || self.solid[i] {
                 continue;
             }
             let w = primitive(self.q[i], self.gamma);
@@ -402,7 +405,7 @@ impl Compressible {
             time: self.time,
             velocity,
             pressure,
-            solid: self.solid.clone(),
+            solid: self.geometry.sample_solid.clone(),
             drag: (2.0 * self.force[0]) as f32,
             lift: (2.0 * self.force[1]) as f32,
             mean_density: density / count as f64,
@@ -416,24 +419,34 @@ mod tests {
     use super::*;
     use crate::Config;
     fn periodic(width: usize, height: usize, re: f64) -> Compressible {
-        let mut grid = Lattice::new(Config {
+        let cfg = Config {
             chord_cells: 64,
             reynolds: re,
             alpha: 0.0,
             contour: vec![],
             mach: 0.5,
             gamma: 1.4,
-        })
-        .unwrap();
-        grid.width = width;
-        grid.height = height;
-        grid.solid = vec![false; width * height];
-        let mut solver = Compressible::new(grid).unwrap();
+        };
+        let mut solver = Compressible::new(&cfg, width, height).unwrap();
         solver.periodic = true;
         solver
     }
     fn totals(s: &Compressible) -> State {
         std::array::from_fn(|k| s.q.iter().map(|q| q[k]).sum())
+    }
+    #[test]
+    fn stationary_shear_has_no_artificial_momentum_or_heat_flux() {
+        for axis in 0..2 {
+            let mut left = [1.0, 0.0, 0.0, 2.0];
+            let mut right = [0.8, 0.0, 0.0, 2.0];
+            left[2 - axis] = 1.0;
+            right[2 - axis] = -0.3;
+            let flux = riemann(left, right, axis, 1.4);
+            assert!((flux[axis + 1] - 2.0).abs() < 1e-12);
+            for k in [0, 2 - axis, 3] {
+                assert!(flux[k].abs() < 1e-12);
+            }
+        }
     }
     #[test]
     fn sod_tube_recovers_star_pressure_velocity_and_conserves() {

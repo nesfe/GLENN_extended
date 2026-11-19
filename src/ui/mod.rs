@@ -38,6 +38,7 @@ pub struct Capture {
     pub native_3d: bool,
     pub input: Option<PathBuf>,
     pub cfd_case: Option<PathBuf>,
+    pub cfd_view: usize,
 }
 impl Capture {
     pub fn from_args(args: &[String]) -> Option<Self> {
@@ -53,6 +54,10 @@ impl Capture {
             .unwrap_or([1440.0, 900.0]);
         Some(Self {
             input: value("--input").map(PathBuf::from),
+            cfd_view: value("--cfd-view")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(3),
             cfd_case: value("--cfd-case").map(PathBuf::from),
             scroll_end: args.iter().any(|arg| arg == "--scroll-end"),
             alpha: value("--alpha").and_then(|s| s.parse().ok()),
@@ -163,6 +168,7 @@ impl Workbench {
         if let Some(capture) = &capture {
             app.page = capture.page.min(8);
             app.native_flow.three_d = capture.native_3d;
+            app.volume_flow.tab = capture.cfd_view;
             app.control_tab = capture.control_tab.min(3);
             app.preset = capture.preset.min(app.presets.len() - 1);
             app.view.animate = false;

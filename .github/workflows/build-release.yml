@@ -114,7 +114,7 @@ jobs:
           Remove-Item -Recurse artifacts/package
           & "C:/Program Files/7-Zip/7z.exe" x -y "artifacts/GLENN-Extended-$env:VERSION-windows-x86_64.zip" '-oartifacts/Перенесённая программа'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd.exe' tests/fixtures/cube.stl
+          python scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd.exe' tests/fixtures/cube.stl --compressible
       - name: Bundle native Linux CFD
         if: runner.os == 'Linux'
         run: |
@@ -137,7 +137,7 @@ jobs:
           rm -rf artifacts/package
           mkdir -p 'artifacts/Перенесённая программа'
           tar -xzf "artifacts/GLENN-Extended-$VERSION-linux-x86_64.tar.gz" -C 'artifacts/Перенесённая программа'
-          python3 scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd' tests/fixtures/cube.stl
+          python3 scripts/test_bundled_cfd.py 'artifacts/Перенесённая программа/glenn-cfd' tests/fixtures/cube.stl --compressible
       - name: Prove the uploaded STL survives meshing and disturbs the flow
         shell: bash
         run: |

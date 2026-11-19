@@ -65,7 +65,7 @@ impl Config {
             (false, false) => "simpleFoam",
             (false, true) => "pimpleFoam",
             (true, false) => "rhoSimpleFoam",
-            (true, true) => "rhoPimpleFoam",
+            (true, true) => "rhoCentralFoam",
         }
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -197,11 +197,28 @@ mergePatchPairs ();
     if refinement > 10 {
         return Err("Геометрия слишком тонкая для автоматической сетки: требуется специальная настройка сетки".into());
     }
-    let layers = if cfg.resolution == Resolution::Preview {
-        0
+    // Size the first prism in metres from a flat-plate friction estimate.
+    // OpenFOAM evaluates the resulting yPlus from the solved wall stress.
+    let surface_cell = base_cell / 2.0_f64.powi(refinement as i32);
+    let (sin, cos) = cfg.alpha_degrees.to_radians().sin_cos();
+    let extent = report.max - report.min;
+    let chord = extent.x * cos.abs() + extent.y * sin.abs();
+    let re = cfg.speed * chord / cfg.kinematic_viscosity;
+    let first_height = if cfg.model == FlowModel::Laminar {
+        5.0 * chord / (12.0 * re.sqrt())
     } else {
-        3
+        let skin_friction = 0.026 * re.powf(-1.0 / 7.0);
+        let friction_speed = cfg.speed * (0.5 * skin_friction).sqrt();
+        2.0 * 30.0 * cfg.kinematic_viscosity / friction_speed
+    }
+    .min(0.3 * surface_cell);
+    let growth = 1.25_f64;
+    let layers = match cfg.resolution {
+        Resolution::Preview => 0,
+        quality => (((0.3 * surface_cell / first_height).ln() / growth.ln()).ceil() as usize + 1)
+            .clamp(3, if quality == Resolution::Fine { 24 } else { 18 }),
     };
+    let min_thickness = first_height * 0.2;
     let location = vec(lo + DVec3::splat(l * 0.5));
     write(
         dir,
@@ -224,8 +241,8 @@ castellatedMeshControls {{
 }}
 snapControls {{ nSmoothPatch 3; tolerance 2.0; nSolveIter 30; nRelaxIter 5; nFeatureSnapIter 10; implicitFeatureSnap true; explicitFeatureSnap false; multiRegionFeatureSnap false; }}
 addLayersControls {{
- relativeSizes true; layers {{ body {{ nSurfaceLayers {layers}; }} }}
- expansionRatio 1.2; finalLayerThickness 0.3; minThickness 0.1;
+ relativeSizes false; layers {{ body {{ nSurfaceLayers {layers}; }} }}
+ expansionRatio {growth}; firstLayerThickness {first_height:e}; minThickness {min_thickness:e};
  nGrow 0; featureAngle 60; nRelaxIter 5; nSmoothSurfaceNormals 1;
  nSmoothNormals 3; nSmoothThickness 10; maxFaceThicknessRatio 0.5;
  maxThicknessToMedialRatio 0.3; minMedialAxisAngle 90;
@@ -380,9 +397,13 @@ mergeTolerance 1e-6;
         cfg.iterations as f64
     };
     let convective_dt = l / cfg.speed;
+    let near_wall_cell = if layers > 0 {
+        first_height
+    } else {
+        surface_cell
+    };
     let max_dt = if let Some(t) = cfg.air_temperature {
-        (0.20 * base_cell / 2.0_f64.powi(refinement as i32) / (cfg.speed + Config::sound_speed(t)))
-            .min(convective_dt * 0.02)
+        (0.20 * near_wall_cell / (cfg.speed + Config::sound_speed(t))).min(convective_dt * 0.02)
     } else {
         convective_dt * 0.02
     };
@@ -395,6 +416,16 @@ mergeTolerance 1e-6;
         "Gauss limitedLinearV 1"
     } else {
         "bounded Gauss linearUpwind grad(U)"
+    };
+    let reconstruction = if transient_gas {
+        "reconstruct(rho) vanLeer; reconstruct(U) vanLeerV; reconstruct(T) vanLeer;"
+    } else {
+        ""
+    };
+    let conservative_equations = if transient_gas {
+        "\"(rho|rhoU|rhoE)\" { solver diagonal; }"
+    } else {
+        ""
     };
     let write_control = if transient {
         "adjustableRunTime"
@@ -435,11 +466,12 @@ functions {{
         header("dictionary", "fvSchemes")
             + &format!(
                 r#"
+fluxScheme Kurganov;
 ddtSchemes {{ default {}; }}
 gradSchemes {{ default cellLimited Gauss linear 1; }}
-divSchemes {{ default none; {energy_schemes} div(phi,U) {advective_scheme}; div(phi,k) bounded Gauss upwind; div(phi,omega) bounded Gauss upwind; div((nuEff*dev2(T(grad(U))))) Gauss linear; }}
+divSchemes {{ default none; div(tauMC) Gauss linear; {energy_schemes} div(phi,U) {advective_scheme}; div(phi,k) bounded Gauss upwind; div(phi,omega) bounded Gauss upwind; div((nuEff*dev2(T(grad(U))))) Gauss linear; }}
 laplacianSchemes {{ default Gauss linear limited 0.5; }}
-interpolationSchemes {{ default linear; }}
+interpolationSchemes {{ default linear; {reconstruction} }}
 snGradSchemes {{ default limited 0.5; }}
 wallDist {{ method meshWave; }}
 "#,
@@ -464,15 +496,16 @@ wallDist {{ method meshWave; }}
         header("dictionary", "fvSolution")
             + &r#"
 solvers {
+ $CONSERVATIVE
  p { solver GAMG; tolerance 1e-8; relTol 0.05; smoother GaussSeidel; }
  pFinal { $p; relTol 0; }
- "(rho|U|k|omega|e)" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0.1; }
- "(rho|U|k|omega|e)Final" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0; }
+ "(U|k|omega|e)" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0.1; }
+ "(U|k|omega|e)Final" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0; }
 }
 SIMPLE { nNonOrthogonalCorrectors 1; $PRESSURE_CONTROL residualControl { p 1e-5; U 1e-6; "(k|omega|e)" 1e-6; } }
 PIMPLE { nOuterCorrectors 2; nCorrectors 2; nNonOrthogonalCorrectors 1; }
 relaxationFactors { $RELAXATION }
-"#.replace("$PRESSURE_CONTROL",pressure_controls).replace("$RELAXATION",relaxation),
+"#.replace("$CONSERVATIVE",conservative_equations).replace("$PRESSURE_CONTROL",pressure_controls).replace("$RELAXATION",relaxation),
     )?;
     // Sample a regular cloud for a shared 3D interpolator and slice display.
     // Fluid cells outside mesh and inside solids remain explicitly missing.
