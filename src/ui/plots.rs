@@ -25,6 +25,17 @@ pub fn scatter(ui: &mut egui::Ui, title: &str, x_label: &str, y_label: &str, poi
         true,
     )
 }
+fn tick(value: f64, interval: f64) -> String {
+    if value == 0.0 {
+        return "0".into();
+    }
+    if value.abs() >= 1e5 || interval < 1e-3 {
+        return format!("{value:.1e}");
+    }
+    let decimals = (1.0 - interval.log10().floor()).clamp(0.0, 5.0) as usize;
+    format!("{value:.decimals$}")
+}
+
 fn draw(
     ui: &mut egui::Ui,
     title: &str,
@@ -64,8 +75,16 @@ fn draw(
     if !xmin.is_finite() {
         return;
     }
-    let dx = (xmax - xmin).max(0.01);
-    let dy = (ymax - ymin).max(0.01);
+    let dx = if xmax > xmin {
+        xmax - xmin
+    } else {
+        xmin.abs().max(1.0) * 0.02
+    };
+    let dy = if ymax > ymin {
+        ymax - ymin
+    } else {
+        ymin.abs().max(1.0) * 0.02
+    };
     xmin -= 0.03 * dx;
     xmax += 0.03 * dx;
     ymin -= 0.08 * dy;
@@ -95,7 +114,7 @@ fn draw(
         painter.text(
             Pos2::new(x, plot.bottom() + 8.0),
             egui::Align2::CENTER_TOP,
-            format!("{:.2}", xmin + (xmax - xmin) * t as f64),
+            tick(xmin + (xmax - xmin) * t as f64, (xmax - xmin) / 4.0),
             egui::FontId::monospace(10.0),
             MUTED,
         );
@@ -107,7 +126,7 @@ fn draw(
         painter.text(
             Pos2::new(plot.left() - 6.0, y),
             egui::Align2::RIGHT_CENTER,
-            format!("{value:.2}"),
+            tick(value, (ymax - ymin) / 4.0),
             egui::FontId::monospace(10.0),
             MUTED,
         );
