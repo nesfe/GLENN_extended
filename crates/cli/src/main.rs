@@ -35,6 +35,14 @@ fn execute() -> Result<(), String> {
                 .fold(f64::INFINITY, f64::min),
             r.converged
         );
+        if let Some((i, speed)) = r.strongest_backflow {
+            println!(
+                "backflow_m_s={speed:.8} position_m={:?}",
+                r.field.position(i).to_array()
+            );
+        } else {
+            println!("backflow_m_s=0");
+        }
         return Ok(());
     }
     let mut cfg = Config::default();

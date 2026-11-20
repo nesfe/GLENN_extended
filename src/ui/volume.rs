@@ -59,6 +59,8 @@ pub struct Volume {
     show_lines: bool,
     reference_area: f64,
     mean_from: f64,
+    force_axis: ForceAxis,
+    recent_forces: bool,
     comparison: super::volume_compare::Comparison,
     animate: bool,
     clock: f64,
@@ -147,6 +149,8 @@ impl Default for Volume {
             close_slice: true,
             reference_area: 0.0,
             mean_from: 0.0,
+            force_axis: ForceAxis::Drag,
+            recent_forces: false,
             comparison: Default::default(),
             show_lines: true,
             animate: true,
@@ -504,7 +508,7 @@ impl Volume {
                     }
                 }
             }
-            charts(ui, result);
+            charts(ui, result, &mut self.force_axis, &mut self.recent_forces);
             if !result.result.wall_pressure.is_empty() {
                 let f = &result.result.field;
                 ui.add(
@@ -554,14 +558,20 @@ impl Volume {
                 } else {
                     "iteration"
                 });
-                csv.push_str(",Fx_N,Fy_N,Fz_N,CL,CD\n");
+                csv.push_str(",Fx_N,Fy_N,Fz_N,CL,CD,lift_N,drag_N\n");
                 for &(t, f) in &result.result.force_history {
                     use std::fmt::Write;
                     let coeff = result
                         .config
                         .coefficients(f, self.reference_area)
                         .map_or_else(|| ",".to_owned(), |(cl, cd)| format!("{cl},{cd}"));
-                    writeln!(&mut csv, "{t},{},{},{},{coeff}", f.x, f.y, f.z).unwrap();
+                    let (lift, drag) = result.config.wind_forces(f);
+                    writeln!(
+                        &mut csv,
+                        "{t},{},{},{},{coeff},{lift},{drag}",
+                        f.x, f.y, f.z
+                    )
+                    .unwrap();
                 }
                 if let Err(e) = std::fs::write(path, csv) {
                     self.error = Some(e.to_string());
@@ -727,7 +737,14 @@ fn force_mean_change(samples: &[(f64, glam::DVec3)]) -> Option<(usize, glam::DVe
     Some((window, change))
 }
 
-fn charts(ui: &mut egui::Ui, completed: &Completed) {
+#[derive(Clone, Copy, PartialEq)]
+enum ForceAxis {
+    Drag,
+    Lift,
+    Body,
+}
+
+fn charts(ui: &mut egui::Ui, completed: &Completed, axis: &mut ForceAxis, recent: &mut bool) {
     use super::plots::plot;
     use glenn_extended::model::Point;
     let r = &completed.result;
@@ -737,24 +754,59 @@ fn charts(ui: &mut egui::Ui, completed: &Completed) {
         "Итерация SIMPLE"
     };
     let colors = [CYAN, AMBER, Color32::LIGHT_GREEN, Color32::LIGHT_RED];
-    let forces: [Vec<Point>; 3] = std::array::from_fn(|i| {
-        r.force_history
-            .iter()
-            .map(|(t, f)| Point::new(*t, f[i]))
-            .collect()
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(axis, ForceAxis::Drag, "Сопротивление");
+        ui.selectable_value(axis, ForceAxis::Lift, "Подъёмная сила");
+        ui.selectable_value(axis, ForceAxis::Body, "Оси модели");
+        if r.force_history.len() > 100 {
+            ui.checkbox(recent, "Последние 100 отсчётов");
+        }
     });
-    plot(
-        ui,
-        "Силы на модели",
-        x,
-        "Н",
-        &[
-            ("Fx", &forces[0], colors[0]),
-            ("Fy", &forces[1], colors[1]),
-            ("Fz", &forces[2], colors[2]),
-        ],
-        false,
-    );
+    let start = if *recent {
+        r.force_history.len().saturating_sub(100)
+    } else {
+        0
+    };
+    let history = &r.force_history[start..];
+    match axis {
+        ForceAxis::Body => {
+            let forces: [Vec<Point>; 3] = std::array::from_fn(|i| {
+                history.iter().map(|(t, f)| Point::new(*t, f[i])).collect()
+            });
+            plot(
+                ui,
+                "Силы на модели",
+                x,
+                "Н",
+                &[
+                    ("Fx", &forces[0], colors[0]),
+                    ("Fy", &forces[1], colors[1]),
+                    ("Fz", &forces[2], colors[2]),
+                ],
+                false,
+            );
+        }
+        ForceAxis::Drag | ForceAxis::Lift => {
+            let wind = completed.config.wind_direction();
+            let (label, direction) = if *axis == ForceAxis::Drag {
+                ("Сопротивление", wind)
+            } else {
+                ("Подъёмная сила", glam::DVec3::Z.cross(wind))
+            };
+            let points: Vec<_> = history
+                .iter()
+                .map(|(t, force)| Point::new(*t, direction.dot(*force)))
+                .collect();
+            plot(
+                ui,
+                "Нагрузка в потоке",
+                x,
+                "Н",
+                &[(label, &points, CYAN)],
+                false,
+            );
+        }
+    }
     if completed.config.model != FlowModel::UnsteadyRans
         && let Some((window, change)) = force_mean_change(&r.force_history)
     {
@@ -811,17 +863,38 @@ fn show_slice(
     let field = &completed.result.field;
     ui.horizontal_wrapped(|ui| {
         ui.add(egui::Slider::new(slice, 0..=field.dims[2] - 1).text("Сечение Z"));
-        for (i, label) in ["Скорость X, м/с", "Давление, Па", "|ω|, 1/с"]
-            .iter()
-            .enumerate()
+        for (i, label) in [
+            "Скорость X, м/с",
+            "Давление, Па",
+            "|ω|, 1/с",
+            "Обратная скорость, м/с",
+        ]
+        .iter()
+        .enumerate()
         {
             ui.selectable_value(quantity, i, *label);
         }
     });
+    let wind = completed.config.wind_direction();
+    if let Some((index, speed)) = completed.result.strongest_backflow {
+        if ui
+            .button(format!("К максимуму обратного течения · {speed:.2} м/с"))
+            .clicked()
+        {
+            *slice = index / (field.dims[0] * field.dims[1]);
+            *quantity = 3;
+            *close = false;
+        }
+    } else if *quantity == 3 {
+        ui.small(
+            "В отсчётах этого поля поток всюду направлен вперёд или поперёк набегающего воздуха.",
+        );
+    }
     let val = |i: usize| match *quantity {
         0 => field.velocity[i].map(|v| v.x),
         1 => field.pressure[i],
-        _ => field.vorticity[i].map(|v| v.length()),
+        2 => field.vorticity[i].map(|v| v.length()),
+        _ => field.velocity[i].map(|v| (-v.dot(wind)).max(0.0)),
     };
     let offset = *slice * field.dims[0] * field.dims[1];
     let count = field.dims[0] * field.dims[1];
@@ -835,6 +908,11 @@ fn show_slice(
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
                 (lo.min(v), hi.max(v))
             });
+        let lo = if *quantity == 3 && lo.is_finite() {
+            0.0
+        } else {
+            lo
+        };
         let mut pixels = Vec::with_capacity(count);
         for y in (0..ny).rev() {
             for x in 0..nx {
@@ -888,7 +966,7 @@ fn show_slice(
         ui.label("Нет данных в этом сечении");
         return;
     }
-    let unit = ["м/с", "Па", "1/с"][*quantity];
+    let unit = ["м/с", "Па", "1/с", "м/с"][*quantity];
     ui.label(format!(
         "Z = {:.3} м · тёмные ячейки вне поля данных",
         field.position(offset).z
@@ -911,7 +989,7 @@ fn show_slice(
                     Vec2::new(rect.width() / 64.0 + 0.5, rect.height()),
                 ),
                 0,
-                slice_color(i as f64 / 63.0),
+                slice_color(if hi == lo { 0.0 } else { i as f64 / 63.0 }),
             );
         }
         ui.label(format!("{hi:.3} {unit}"));
@@ -951,6 +1029,13 @@ fn show_slice(
             [screen(a), screen(b)],
             egui::Stroke::new(1.4, Color32::WHITE),
         );
+    }
+    if *quantity == 3
+        && let Some((index, _)) = completed.result.strongest_backflow
+        && (offset..offset + count).contains(&index)
+    {
+        let at = screen(field.position(index).truncate());
+        painter.circle_stroke(at, 5.0, egui::Stroke::new(2.0, Color32::WHITE));
     }
     if let Some(p) = response.hover_pos() {
         let fraction = glam::DVec2::new(

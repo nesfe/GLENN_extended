@@ -38,6 +38,8 @@ with tempfile.TemporaryDirectory(prefix='glenn-case-Продувка ') as tmp:
         if mode == 'laminar':
             value = inspection.stdout.split('min_Ux=')[1].split()[0]
             assert float(value) < -0.01, 'Missing resolved backflow at Re=100'
+            reverse = float(inspection.stdout.split('backflow_m_s=')[1].split()[0])
+            assert abs(reverse + float(value)) < 1e-7, 'Incorrect backflow projection at zero incidence'
         assert json.loads((case / 'glenn-case.json').read_text())['speed'] == (170.0 if gas else 1.0)
         if gas:
             solver = 'rhoCentralFoam' if mode == 'urans' else 'rhoSimpleFoam'

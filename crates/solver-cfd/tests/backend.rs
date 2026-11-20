@@ -201,3 +201,20 @@ fn surface_layers_get_thinner_as_friction_speed_increases() {
     }
     assert!(thicknesses[1] > 0.0 && thicknesses[1] < thicknesses[0]);
 }
+
+#[test]
+fn dimensional_loads_and_coefficients_share_the_inlet_axes() {
+    let cfg = Config {
+        alpha_degrees: -30.0,
+        speed: 10.0,
+        density: 1.0,
+        ..Config::default()
+    };
+    let wind = cfg.wind_direction();
+    let up = glam::DVec3::Z.cross(wind);
+    let force = 40.0 * up + 5.0 * wind + glam::DVec3::Z * 8.0;
+    let (lift, drag) = cfg.wind_forces(force);
+    assert!((lift - 40.).abs() < 1e-12 && (drag - 5.).abs() < 1e-12);
+    let (cl, cd) = cfg.coefficients(force, 2.0).unwrap();
+    assert!((cl - 0.4).abs() < 1e-12 && (cd - 0.05).abs() < 1e-12);
+}

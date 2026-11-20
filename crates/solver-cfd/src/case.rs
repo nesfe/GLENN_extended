@@ -102,16 +102,21 @@ impl Config {
         if !area.is_finite() || area <= 0. {
             return None;
         }
-        let (s, c) = self.alpha_degrees.to_radians().sin_cos();
+        let (lift, drag) = self.wind_forces(force);
         let qa = 0.5 * self.density * self.speed.powi(2) * area;
-        Some((
-            (-s * force.x + c * force.y) / qa,
-            (c * force.x + s * force.y) / qa,
-        ))
+        Some((lift / qa, drag / qa))
+    }
+    pub fn wind_direction(&self) -> DVec3 {
+        let (sin, cos) = self.alpha_degrees.to_radians().sin_cos();
+        DVec3::new(cos, sin, 0.0)
+    }
+    /// Lift and drag in newtons in the inlet wind axes.
+    pub fn wind_forces(&self, force: DVec3) -> (f64, f64) {
+        let wind = self.wind_direction();
+        (wind.x * force.y - wind.y * force.x, wind.dot(force))
     }
     pub fn velocity(&self) -> DVec3 {
-        let a = self.alpha_degrees.to_radians();
-        DVec3::new(a.cos(), a.sin(), 0.0) * self.speed
+        self.wind_direction() * self.speed
     }
 }
 fn header(class: &str, name: &str) -> String {

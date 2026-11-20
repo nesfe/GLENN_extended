@@ -1,6 +1,7 @@
 use glam::DVec3;
 use std::{
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 #[derive(Clone, Debug)]
@@ -15,6 +16,18 @@ pub struct VolumeField {
     pub time: f64,
 }
 impl VolumeField {
+    /// Index and speed of the fastest sample opposing the unit inlet direction.
+    pub fn strongest_backflow(&self, wind: DVec3) -> Option<(usize, f64)> {
+        self.velocity
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| {
+                let reverse = -sample.as_ref()?.dot(wind);
+                (reverse > 0.0).then_some((index, reverse))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
     pub fn position(&self, i: usize) -> DVec3 {
         let x = i % self.dims[0];
         let y = i / self.dims[0] % self.dims[1];
@@ -83,23 +96,32 @@ impl VolumeField {
         self.streamlines_around(None)
     }
     pub fn streamlines_around(&self, body: Option<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
+        self.streamlines_in_wind(body, DVec3::X)
+    }
+    pub(crate) fn streamlines_in_wind(
+        &self,
+        body: Option<(DVec3, DVec3)>,
+        wind: DVec3,
+    ) -> Vec<Vec<DVec3>> {
         let step = (self.max - self.min).min_element() / 180.0;
         let mut seeds = Vec::new();
         let (lo, hi) = body.unwrap_or((self.min, self.max));
-        // Concentrate the inlet rake on the body's silhouette. Uniform seeds
-        // over the farfield passed metres above/below thin wings.
+        let center = 0.5 * (lo + hi);
         let extent = hi - lo;
-        let pad_y = (extent.y * 0.25).max(extent.x * 0.08);
+        let across = DVec3::Z.cross(wind);
+        let thickness = extent.dot(across.abs());
+        let padding = (thickness * 0.25).max(extent.dot(wind.abs()) * 0.08);
+        let inside_min = self.min + DVec3::splat(step);
+        let inside_max = self.max - DVec3::splat(step);
         for z in 0..7 {
-            for y in 0..7 {
-                let seed = DVec3::new(
-                    self.min.x + (self.max.x - self.min.x) * 0.02,
-                    (lo.y - pad_y + (extent.y + 2.0 * pad_y) * y as f64 / 6.0)
-                        .clamp(self.min.y + step, self.max.y - step),
-                    (lo.z + extent.z * (z as f64 + 0.5) / 7.0)
-                        .clamp(self.min.z + step, self.max.z - step),
-                );
-                seeds.push(seed);
+            for lane in 0..7 {
+                let offset = (thickness + 2.0 * padding) * (lane as f64 / 6.0 - 0.5);
+                let mut target = center + offset * across;
+                target.z =
+                    (lo.z + extent.z * (z as f64 + 0.5) / 7.0).clamp(inside_min.z, inside_max.z);
+                if let Some(seed) = upstream_entry(target, wind, inside_min, inside_max) {
+                    seeds.push(seed);
+                }
             }
         }
         // Inlet-only seeds cannot enter a closed recirculation bubble. Seed
@@ -110,10 +132,11 @@ impl VolumeField {
             .velocity
             .iter()
             .flatten()
-            .map(|v| v.length())
-            .fold(0.0, f64::max);
+            .map(|v| v.length_squared())
+            .fold(0.0, f64::max)
+            .sqrt();
         for (i, v) in self.velocity.iter().enumerate() {
-            if v.is_some_and(|v| v.x < -0.03 * max_speed) {
+            if v.is_some_and(|v| v.dot(wind) < -0.03 * max_speed) {
                 let p = self.position(i);
                 if wake_seeds
                     .iter()
@@ -151,6 +174,25 @@ impl VolumeField {
         lines
     }
 }
+/// First intersection of a wind-aligned line with the sampled fluid box.
+fn upstream_entry(target: DVec3, wind: DVec3, min: DVec3, max: DVec3) -> Option<DVec3> {
+    let mut entry = f64::NEG_INFINITY;
+    let mut exit = f64::INFINITY;
+    for axis in 0..2 {
+        if wind[axis].abs() < 1e-12 {
+            if !(min[axis]..=max[axis]).contains(&target[axis]) {
+                return None;
+            }
+        } else {
+            let a = (min[axis] - target[axis]) / wind[axis];
+            let b = (max[axis] - target[axis]) / wind[axis];
+            entry = entry.max(a.min(b));
+            exit = exit.min(a.max(b));
+        }
+    }
+    (entry <= exit).then(|| target + entry * wind)
+}
+
 fn time_directories(dir: &Path) -> Result<Vec<(f64, PathBuf)>, String> {
     let mut times: Vec<_> = fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -201,18 +243,31 @@ pub fn read_field(case: &Path, density: f64) -> Result<VolumeField, String> {
             continue;
         };
         let names: Vec<_> = fields.split('_').collect();
-        let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        for line in data
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        {
-            let v: Vec<f64> = line
-                .split_whitespace()
-                .map(|s| {
-                    s.parse()
-                        .map_err(|_| format!("Повреждённая запись CFD: {}", path.display()))
-                })
-                .collect::<Result<_, _>>()?;
+        let file = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut line = String::new();
+        let mut v: Vec<f64> = Vec::with_capacity(3 + names.len() * 3);
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                == 0
+            {
+                break;
+            }
+            let row = line.trim();
+            if row.is_empty() || row.starts_with('#') {
+                continue;
+            }
+            v.clear();
+            for token in row.split_whitespace() {
+                v.push(
+                    token
+                        .parse()
+                        .map_err(|_| format!("Повреждённая запись CFD: {}", path.display()))?,
+                );
+            }
             if v.len() < 4 {
                 continue;
             }
@@ -367,6 +422,34 @@ fn load_segment(dir: &Path) -> Result<Vec<(f64, DVec3)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tilted_wind_sets_the_inlet_and_the_sign_of_backflow() {
+        let mut f = VolumeField {
+            dims: [5; 3],
+            min: DVec3::ZERO,
+            max: DVec3::splat(4.0),
+            velocity: vec![Some(DVec3::Y); 125],
+            pressure: vec![None; 125],
+            vorticity: vec![None; 125],
+            time: 1.0,
+        };
+        let body = Some((DVec3::ONE, DVec3::splat(3.)));
+        let lines = f.streamlines_in_wind(body, DVec3::Y);
+        assert_eq!(lines.len(), 49);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line[0].y < 0.1 && line.last().unwrap().y > 3.8)
+        );
+        f.velocity[0] = None;
+        f.velocity[30] = Some(DVec3::new(-25., 1., 0.));
+        f.velocity[42] = Some(DVec3::new(3., -7., 1.));
+        assert_eq!(f.strongest_backflow(DVec3::Y), Some((42, 7.)));
+        assert_eq!(f.strongest_backflow(DVec3::X), Some((30, 25.)));
+        assert_eq!(f.strongest_backflow(DVec3::Z), None);
+        let seed = upstream_entry(DVec3::splat(2.), -DVec3::Y, f.min, f.max).unwrap();
+        assert_eq!(seed.y, f.max.y);
+    }
     #[test]
     fn trilinear_interpolation_reproduces_affine_field_and_rejects_solid() {
         let mut f = VolumeField {

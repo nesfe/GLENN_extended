@@ -20,6 +20,7 @@ pub struct Backend {
 pub struct RunResult {
     pub field: VolumeField,
     pub force: DVec3,
+    pub strongest_backflow: Option<(usize, f64)>,
     pub wall_pressure: Vec<(DVec3, f64)>,
     pub wall_faces: usize,
     pub wall_y_plus: Option<[f64; 3]>,
@@ -363,9 +364,10 @@ pub fn load_result(case: &Path) -> Result<RunResult, String> {
     } else {
         None
     };
-    let streamlines = field.streamlines_around(bounds);
+    let streamlines = field.streamlines_in_wind(bounds, cfg.wind_direction());
     Ok(RunResult {
         wall_faces,
+        strongest_backflow: field.strongest_backflow(cfg.wind_direction()),
         wall_pressure: crate::field::wall_pressure(case, field.time, &cfg)?,
         wall_y_plus: crate::field::wall_y_plus(case, field.time),
         field,
