@@ -57,6 +57,7 @@ pub struct Volume {
     slice_map: Option<SliceMap>,
     close_slice: bool,
     show_lines: bool,
+    expanded: bool,
     reference_area: f64,
     mean_from: f64,
     force_axis: ForceAxis,
@@ -153,6 +154,7 @@ impl Default for Volume {
             recent_forces: false,
             comparison: Default::default(),
             show_lines: true,
+            expanded: false,
             animate: true,
             clock: 0.0,
             last_frame: None,
@@ -164,6 +166,7 @@ impl Volume {
         self.busy || self.preview_busy
     }
     pub fn open_case(&mut self, path: PathBuf) {
+        self.expanded = false;
         self.worker.submit(Request {
             mesh: None,
             cfg: self.cfg.clone(),
@@ -175,6 +178,7 @@ impl Volume {
         self.error = None;
     }
     pub fn set_mesh(&mut self, mesh: SolidMesh, name: String) {
+        self.expanded = false;
         self.worker.cancel();
         self.busy = false;
         self.comparison.reset();
@@ -248,6 +252,22 @@ impl Volume {
         }
     }
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        if self.expanded {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Свернуть").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    self.expanded = false;
+                }
+                ui.selectable_value(&mut self.tab, 0, "3D-поток");
+                ui.add_enabled_ui(self.result.is_some(), |ui| {
+                    ui.selectable_value(&mut self.tab, 1, "Срез поля");
+                });
+            });
+            if self.expanded {
+                self.spatial_view(ui);
+                return;
+            }
+        }
         ui.heading("Объёмная CFD · STL / крыло");
         ui.label(format!("OpenFOAM 2412 · {}", self.cfg.solver()));
         if let Some(error) = &self.error {
@@ -328,29 +348,13 @@ impl Volume {
                     ui.selectable_value(&mut self.tab, index, label);
                 });
             }
+            if !self.busy && matches!(self.tab, 0 | 1) && ui.button("Развернуть").clicked()
+            {
+                self.expanded = true;
+            }
         });
         if self.tab == 0 {
-            // Show the imported model immediately, before settings that can scroll
-            // it below the window. Camera fitting uses its projected silhouette.
-            ui.horizontal_wrapped(|ui| {
-                for (label, yaw, pitch) in [
-                    ("Изометрия", -0.65, 0.48),
-                    ("Сверху", 0.0, 1.57),
-                    ("Сбоку", 0.0, 0.0),
-                ] {
-                    if ui.button(label).clicked() {
-                        self.yaw = yaw;
-                        self.pitch = pitch;
-                        self.zoom = 1.0;
-                    }
-                }
-                if ui.button("Вписать модель").clicked() {
-                    self.zoom = 1.0;
-                }
-                ui.checkbox(&mut self.show_lines, "Линии тока");
-                ui.checkbox(&mut self.animate, "Анимация");
-            });
-            self.viewport(ui);
+            self.spatial_view(ui);
         }
         if self.tab == 3 {
             let mut air = self.cfg.air_temperature.is_some();
@@ -577,6 +581,34 @@ impl Volume {
                     self.error = Some(e.to_string());
                 }
             }
+        }
+        if self.tab == 1 {
+            self.spatial_view(ui);
+        }
+    }
+    fn spatial_view(&mut self, ui: &mut egui::Ui) {
+        if self.tab == 0 {
+            // Show the imported model immediately, before settings that can scroll
+            // it below the window. Camera fitting uses its projected silhouette.
+            ui.horizontal_wrapped(|ui| {
+                for (label, yaw, pitch) in [
+                    ("Изометрия", -0.65, 0.48),
+                    ("Сверху", 0.0, 1.57),
+                    ("Сбоку", 0.0, 0.0),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.yaw = yaw;
+                        self.pitch = pitch;
+                        self.zoom = 1.0;
+                    }
+                }
+                if ui.button("Вписать модель").clicked() {
+                    self.zoom = 1.0;
+                }
+                ui.checkbox(&mut self.show_lines, "Линии тока");
+                ui.checkbox(&mut self.animate, "Анимация");
+            });
+            self.viewport(ui);
         }
         if self.tab == 1
             && let Some(result) = &self.result
@@ -876,6 +908,7 @@ fn show_slice(
         }
     });
     let wind = completed.config.wind_direction();
+    let mut focus = None;
     if let Some((index, speed)) = completed.result.strongest_backflow {
         if ui
             .button(format!("К максимуму обратного течения · {speed:.2} м/с"))
@@ -883,7 +916,7 @@ fn show_slice(
         {
             *slice = index / (field.dims[0] * field.dims[1]);
             *quantity = 3;
-            *close = false;
+            focus = Some(field.position(index).truncate());
         }
     } else if *quantity == 3 {
         ui.small(
@@ -966,6 +999,23 @@ fn show_slice(
         ui.label("Нет данных в этом сечении");
         return;
     }
+    let model_window = c.section_bounds.map(|(a, b)| {
+        let chord = (b - a).max_element();
+        (
+            field
+                .min
+                .truncate()
+                .max(a - glam::DVec2::new(0.38, 0.43) * chord),
+            field
+                .max
+                .truncate()
+                .min(b + glam::DVec2::new(0.85, 0.43) * chord),
+        )
+    });
+    if let Some(at) = focus {
+        *close =
+            model_window.is_some_and(|(low, high)| at.cmpge(low).all() && at.cmple(high).all());
+    }
     let unit = ["м/с", "Па", "1/с", "м/с"][*quantity];
     ui.label(format!(
         "Z = {:.3} м · тёмные ячейки вне поля данных",
@@ -994,13 +1044,9 @@ fn show_slice(
         }
         ui.label(format!("{hi:.3} {unit}"));
     });
-    let mut low = field.min.truncate();
-    let mut high = field.max.truncate();
-    if *close && let Some((a, b)) = c.section_bounds {
-        let chord = (b - a).max_element();
-        low = low.max(a - glam::DVec2::new(0.38, 0.43) * chord);
-        high = high.min(b + glam::DVec2::new(0.85, 0.43) * chord);
-    }
+    let (low, high) = model_window
+        .filter(|_| *close)
+        .unwrap_or((field.min.truncate(), field.max.truncate()));
     let span = (high - low).as_vec2();
     let ratio = span.x / span.y;
     let h = (ui.available_width() / ratio)
