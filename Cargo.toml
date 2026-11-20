@@ -27,7 +27,7 @@ cpal = { version = "0.15", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 bytemuck = { version = "1", features = ["derive"] }
-glam = "0.30"
+glam = "0.34"
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles", "dx12", "metal"] }
 
 [features]
